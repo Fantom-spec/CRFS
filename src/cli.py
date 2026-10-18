@@ -8,6 +8,7 @@ Supports both interactive shell and single-command modes.
 import sys
 import argparse
 import shlex
+import textwrap
 from typing import List, Optional
 from .filesystem import (
     FileSystem, create_filesystem, open_filesystem,
@@ -71,6 +72,10 @@ class CLI:
                 self.cmd_recover(cmd_args)
             elif cmd in ('crash-test', 'crash'):
                 self.cmd_crash_test(cmd_args)
+            elif cmd in ('enable-crash-injection', 'enable-crash'):
+                self.cmd_enable_crash_injection(cmd_args)
+            elif cmd in ('disable-crash-injection', 'disable-crash'):
+                self.cmd_disable_crash_injection(cmd_args)
             elif cmd in ('exit', 'quit', 'q'):
                 self.running = False
                 return 1  # Signal to exit
@@ -114,39 +119,42 @@ class CLI:
     # Command implementations
     def cmd_help(self, args: List[str]) -> None:
         """Show help."""
-        print("""
-Available commands:
-  format [size] [journal_blocks] [inode_blocks] [label]  - Format new filesystem
-  mount                                                  - Mount existing filesystem
-  unmount                                                - Unmount filesystem
-  mkdir <path>                                           - Create directory
-  create <path>                                          - Create empty file
-  write <path> <text>                                    - Write text to file
-  read <path>                                            - Read file contents
-  append <path> <text>                                   - Append text to file
-  ls [path]                                              - List directory (default: /)
-  stat <path>                                            - Show file/directory info
-  rename <old> <new>                                     - Rename/move file or directory
-  delete <path>                                          - Delete file
-  rmdir <path>                                           - Remove empty directory
-  df                                                     - Show disk usage
-  dump                                                   - Dump filesystem state
-  check                                                  - Run consistency check
-  recover                                                - Run crash recovery
-  crash-test <scenario>                                  - Run crash test scenario
-  help                                                   - Show this help
-  exit                                                   - Exit simulator
+        help_text = textwrap.dedent("""
+            Available commands:
+              format [size] [journal_blocks] [inode_blocks] [label]  - Format new filesystem
+              mount                                                  - Mount existing filesystem
+              unmount                                                - Unmount filesystem
+              mkdir <path>                                           - Create directory
+              create <path>                                          - Create empty file
+              write <path> <text>                                    - Write text to file
+              read <path>                                            - Read file contents
+              append <path> <text>                                   - Append text to file
+              ls [path]                                              - List directory (default: /)
+              stat <path>                                            - Show file/directory info
+              rename <old> <new>                                     - Rename/move file or directory
+              delete <path>                                          - Delete file
+              rmdir <path>                                           - Remove empty directory
+              df                                                     - Show disk usage
+              dump                                                   - Dump filesystem state
+              check                                                  - Run consistency check
+              recover                                                - Run crash recovery
+              crash-test <scenario>                                  - Run crash test scenario
+              enable-crash-injection <mode>                          - Enable crash injection
+              disable-crash-injection                                - Disable crash injection
+              help                                                   - Show this help
+              exit                                                   - Exit simulator
 
-Examples:
-  format 16M 128 64 "MyVolume"
-  mkdir /home/user
-  create /home/user/file.txt
-  write /home/user/file.txt "Hello World"
-  read /home/user/file.txt
-  ls /home/user
-  stat /home/user/file.txt
-  crash-test crash_after_commit_flush_before_apply
-""")
+            Examples:
+              format 16M 128 64 "MyVolume"
+              mkdir /home/user
+              create /home/user/file.txt
+              write /home/user/file.txt "Hello World"
+              read /home/user/file.txt
+              ls /home/user
+              stat /home/user/file.txt
+              crash-test crash_after_commit_flush_before_apply
+            """)
+        print(help_text)
     
     def cmd_format(self, args: List[str]) -> None:
         """Format filesystem."""
@@ -389,8 +397,35 @@ Examples:
             print(f"Crash injected: {e}")
         finally:
             self.fs.disable_crash_injection()
-
-
+    
+    def cmd_enable_crash_injection(self, args: List[str]) -> None:
+        """Enable crash injection."""
+        if not args:
+            print("Usage: enable-crash-injection <mode>")
+            print("Modes: exception, subprocess, none")
+            return
+        
+        mode_str = args[0].lower()
+        if mode_str == 'exception':
+            mode = CrashMode.EXCEPTION
+        elif mode_str == 'subprocess':
+            mode = CrashMode.SUBPROCESS
+        elif mode_str == 'none':
+            mode = CrashMode.NONE
+        else:
+            print(f"Unknown mode: {mode_str}")
+            print("Modes: exception, subprocess, none")
+            return
+        
+        self.fs.enable_crash_injection(mode)
+        print(f"Crash injection enabled: {mode.value}")
+    
+    def cmd_disable_crash_injection(self, args: List[str]) -> None:
+        """Disable crash injection."""
+        self.fs.disable_crash_injection()
+        print("Crash injection disabled")
+    
+    
 def main():
     """Main entry point."""
     parser = argparse.ArgumentParser(description="CRFS Filesystem Simulator")
