@@ -399,6 +399,9 @@ def main():
     parser.add_argument('-c', '--command', help='Single command to run')
     parser.add_argument('--format', action='store_true', help='Format new filesystem')
     parser.add_argument('--size', default='16M', help='Disk size for format (default: 16M)')
+    parser.add_argument('--journal-blocks', type=int, default=128, help='Journal blocks for format (default: 128)')
+    parser.add_argument('--inode-blocks', type=int, default=64, help='Inode blocks for format (default: 64)')
+    parser.add_argument('--label', default='', help='Volume label for format (default: empty)')
     parser.add_argument('--no-recovery', action='store_true', help='Skip recovery on mount')
     
     args = parser.parse_args()
@@ -419,7 +422,8 @@ def main():
             else:
                 disk_size = int(size_str)
             
-            fs.format(disk_size=disk_size)
+            fs.format(disk_size=disk_size, journal_blocks=args.journal_blocks, 
+                     inode_blocks=args.inode_blocks, volume_label=args.label)
             print(f"Formatted {args.disk} ({disk_size} bytes)")
             return
         
