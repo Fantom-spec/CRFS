@@ -1,35 +1,49 @@
 """
 Recovery Module
 
-Implements crash recovery: journal scanning, validation, replay, and checkpoint management.
+Crash recovery = redo of committed-but-not-checkpointed transactions.
+
+    1. read + verify the superblock from disk (checksum)
+    2. scan the journal from journal_tail, expecting txid checkpoint_txid+1
+    3. replay every valid COMMITTED transaction in order (idempotent: each
+       DATA record is an absolute after-image of a byte range)
+    4. flush the home locations
+    5. checkpoint: new tail / checkpoint_txid in the superblock, flush
+
+Uncommitted, torn, corrupt or out-of-sequence transactions are never
+replayed.  Running recovery twice (or crashing in the middle of it) yields
+the same result.
 """
 
 import time
-from dataclasses import dataclass
-from typing import List, Dict, Set, Optional, Tuple
-from .virtual_disk import VirtualDisk, CrashPoint
-from .superblock import Superblock, SuperblockManager
-from .journal import Journal, Transaction as JournalTransaction, RecordType, TransDataRecord
-from .inode import InodeTable, Inode
+from dataclasses import dataclass, field
+from typing import Any, Dict, List, Optional
+
 from .block_allocator import BlockAllocator
 from .consistency_checker import ConsistencyChecker
+from .inode import InodeTable
+from .journal import Journal, JournalError
+from .superblock import Superblock, SuperblockManager
+from .virtual_disk import CrashPoint, VirtualDisk
 
 
 class RecoveryError(Exception):
-    """Base exception for recovery errors."""
     pass
 
 
 @dataclass
 class RecoveryResult:
-    """Result of recovery operation."""
     success: bool
     transactions_replayed: int
     transactions_discarded: int
     errors: List[str]
     warnings: List[str]
     duration_ms: float
-    
+    replayed: List[Dict[str, Any]] = field(default_factory=list)
+    discarded: List[Dict[str, Any]] = field(default_factory=list)
+    checkpoint_txid: int = 0
+    checker_errors: List[str] = field(default_factory=list)
+
     def __str__(self) -> str:
         status = "SUCCESS" if self.success else "FAILED"
         return (f"Recovery {status}: {self.transactions_replayed} replayed, "
@@ -37,162 +51,139 @@ class RecoveryResult:
                 f"{len(self.errors)} errors, {len(self.warnings)} warnings "
                 f"in {self.duration_ms:.2f}ms")
 
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "success": self.success,
+            "transactions_replayed": self.transactions_replayed,
+            "transactions_discarded": self.transactions_discarded,
+            "errors": self.errors, "warnings": self.warnings,
+            "duration_ms": round(self.duration_ms, 3),
+            "replayed": self.replayed, "discarded": self.discarded,
+            "checkpoint_txid": self.checkpoint_txid,
+            "checker_errors": self.checker_errors,
+        }
+
 
 class RecoveryManager:
-    """Manages filesystem crash recovery."""
-    
-    def __init__(
-        self,
-        disk: VirtualDisk,
-        superblock: Superblock,
-        journal: Journal,
-        inode_table: InodeTable,
-        block_allocator: BlockAllocator
-    ):
+    def __init__(self, disk: VirtualDisk, superblock: Superblock, journal: Journal,
+                 inode_table: InodeTable, block_allocator: BlockAllocator):
         self.disk = disk
         self.superblock = superblock
         self.journal = journal
         self.inode_table = inode_table
         self.block_allocator = block_allocator
-        self._crash_callback = None
-        self._crash_points_enabled = True
-    
+        self.events = None
+
+    def _emit(self, kind, message="", **kw):
+        if self.events is not None:
+            self.events.emit(kind, message, **kw)
+
     def set_crash_callback(self, callback) -> None:
-        """Set crash injection callback."""
-        self._crash_callback = callback
-    
+        self.disk.set_crash_callback(callback)
+
     def enable_crash_points(self, enabled: bool = True) -> None:
-        """Enable/disable crash injection."""
-        self._crash_points_enabled = enabled
         self.disk.enable_crash_points(enabled)
-    
-    def _maybe_crash(self, point: CrashPoint) -> None:
-        if self._crash_points_enabled and self._crash_callback:
-            self._crash_callback(point)
-    
-    def recover(self, run_checker: bool = True) -> RecoveryResult:
-        """
-        Perform full crash recovery.
-        
-        Steps:
-        1. Validate superblock
-        2. Scan journal for committed transactions
-        3. Replay committed transactions
-        4. Flush recovered metadata
-        5. Update checkpoint
-        6. Run consistency checker (optional)
-        """
-        start_time = time.time()
-        errors = []
-        warnings = []
-        transactions_replayed = 0
-        transactions_discarded = 0
-        
-        try:
-            # Step 1: Validate superblock
-            self._maybe_crash(CrashPoint.DURING_RECOVERY_SCAN)
-            self.superblock.validate()
-            
-            # Step 2: Scan journal
-            committed_txs = self._scan_journal()
-            
-            # Count discarded (incomplete) transactions
-            all_txs = self.journal.scan_transactions(from_tail=False)
-            incomplete = [tx for tx in all_txs if not tx.committed]
-            transactions_discarded = len(incomplete)
-            
-            if incomplete:
-                warnings.append(f"Discarded {len(incomplete)} incomplete transactions")
-            
-            # Step 3: Replay committed transactions
-            self._maybe_crash(CrashPoint.DURING_RECOVERY_REPLAY)
-            for tx in committed_txs:
-                try:
-                    self.journal.replay_transaction(tx)
-                    transactions_replayed += 1
-                except Exception as e:
-                    errors.append(f"Failed to replay transaction {tx.txid}: {e}")
-            
-            # Step 4: Flush recovered metadata
-            self.disk.flush()
-            
-            # Step 5: Update checkpoint to last replayed transaction
-            if committed_txs:
-                last_txid = committed_txs[-1].txid
-                self.journal.write_checkpoint(last_txid)
-                self.superblock.checkpoint_txid = last_txid
-                self.superblock._dirty = True
-            
-            # Write superblock
-            self.superblock._checksum = self.superblock.compute_checksum()
-            self.disk.write_block(0, self.superblock.to_bytes())
-            
-            # Step 6: Run consistency checker
-            checker_errors = []
-            if run_checker:
-                checker = ConsistencyChecker(
-                    self.disk, self.superblock, self.inode_table, 
-                    self.block_allocator, self.journal
-                )
-                checker_errors = checker.check_all()
-                if checker_errors:
-                    errors.extend(checker_errors)
-            
-            success = len(errors) == 0
-            duration_ms = (time.time() - start_time) * 1000
-            
-            return RecoveryResult(
-                success=success,
-                transactions_replayed=transactions_replayed,
-                transactions_discarded=transactions_discarded,
-                errors=errors,
-                warnings=warnings,
-                duration_ms=duration_ms
-            )
-            
-        except Exception as e:
-            duration_ms = (time.time() - start_time) * 1000
-            errors.append(f"Recovery failed: {e}")
-            return RecoveryResult(
-                success=False,
-                transactions_replayed=transactions_replayed,
-                transactions_discarded=transactions_discarded,
-                errors=errors,
-                warnings=warnings,
-                duration_ms=duration_ms
-            )
-    
-    def _scan_journal(self) -> List[JournalTransaction]:
-        """Scan journal for committed transactions."""
-        return self.journal.scan_transactions(from_tail=True)
-    
-    def quick_recovery(self) -> RecoveryResult:
-        """Quick recovery: only replay transactions after last checkpoint."""
-        # This is the same as full recovery since we always scan from tail
-        return self.recover(run_checker=False)
-    
+
+    # ------------------------------------------------------------------
+    def _reload_superblock(self) -> None:
+        """Re-read block 0 from disk into the shared in-memory superblock object."""
+        fresh = SuperblockManager(self.disk).read()   # validates magic + checksum
+        for name in fresh.__dataclass_fields__:
+            setattr(self.superblock, name, getattr(fresh, name))
+
     def needs_recovery(self) -> bool:
-        """Check if recovery is needed (journal has uncheckpointed transactions)."""
-        return self.superblock.journal_head != self.superblock.journal_tail
-    
+        """True when the journal holds committed transactions not yet checkpointed."""
+        try:
+            self._reload_superblock()
+            return bool(self.journal.scan().committed)
+        except Exception:
+            return True
+
+    def recover(self, run_checker: bool = False) -> RecoveryResult:
+        start = time.time()
+        errors: List[str] = []
+        warnings: List[str] = []
+        replayed: List[Dict[str, Any]] = []
+        discarded: List[Dict[str, Any]] = []
+        self._emit("recovery_start", "recovery started")
+        try:
+            self.disk.fire(CrashPoint.DURING_RECOVERY_SCAN)
+            self._reload_superblock()
+            j = self.journal
+            j.tail = j.head = self.superblock.journal_tail
+            j.checkpoint_txid = self.superblock.checkpoint_txid
+            scan = j.scan()
+            warnings.extend(scan.warnings)
+            errors.extend(scan.errors)
+            for inc in scan.incomplete:
+                discarded.append(inc)
+                self._emit("recovery_discard",
+                           f"tx {inc['txid']} discarded: {inc['reason']}",
+                           severity="warning", txid=inc["txid"], reason=inc["reason"])
+            self._emit("recovery_scan",
+                       f"journal scan: {len(scan.committed)} committed transaction(s) to replay, "
+                       f"{len(discarded)} discarded", committed=[t.txid for t in scan.committed])
+            if errors:
+                raise RecoveryError("; ".join(errors))
+
+            self.disk.fire(CrashPoint.DURING_RECOVERY_REPLAY)
+            for tx in scan.committed:
+                j.replay_transaction(tx, flush=False)
+                blocks = sorted({r.target_block for r in tx.records})
+                replayed.append({"txid": tx.txid, "blocks": blocks, "records": len(tx.records)})
+                self._emit("recovery_replay",
+                           f"replayed tx {tx.txid}: {len(tx.records)} record(s) -> blocks {blocks}",
+                           txid=tx.txid, blocks=blocks)
+            self.disk.flush("recovery")
+            self.disk.fire(CrashPoint.AFTER_RECOVERY_REPLAY)
+
+            # in-memory superblock must now reflect the replayed home blocks
+            self._reload_superblock()
+            if scan.committed:
+                j.head = scan.end_block
+                j.uncheckpointed = [t.txid for t in scan.committed]
+                j.checkpoint(scan.committed[-1].txid)
+            j.tail = j.head = self.superblock.journal_tail
+            j.checkpoint_txid = self.superblock.checkpoint_txid
+            j.uncheckpointed = []
+            j._next_txid = max(j._next_txid, self.superblock.checkpoint_txid + 1)
+
+            checker_errors: List[str] = []
+            if run_checker:
+                checker_errors = ConsistencyChecker(
+                    self.disk, self.superblock, self.inode_table,
+                    self.block_allocator, self.journal).check_all()
+                errors.extend(checker_errors)
+
+            res = RecoveryResult(
+                success=not errors, transactions_replayed=len(replayed),
+                transactions_discarded=len(discarded), errors=errors, warnings=warnings,
+                duration_ms=(time.time() - start) * 1000, replayed=replayed, discarded=discarded,
+                checkpoint_txid=self.superblock.checkpoint_txid, checker_errors=checker_errors)
+            self._emit("recovery_done", str(res), severity="info" if res.success else "error",
+                       replayed=len(replayed), discarded=len(discarded))
+            return res
+        except Exception as e:
+            from .virtual_disk import CrashInjectedError
+            if isinstance(e, CrashInjectedError):
+                raise
+            errors.append(f"Recovery failed: {e}")
+            self._emit("recovery_done", f"recovery FAILED: {e}", severity="error")
+            return RecoveryResult(False, len(replayed), len(discarded), errors, warnings,
+                                  (time.time() - start) * 1000, replayed, discarded)
+
+    def quick_recovery(self) -> RecoveryResult:
+        return self.recover(run_checker=False)
+
     def get_journal_state(self) -> Dict:
-        """Get journal state for diagnostics."""
         return self.journal.get_journal_stats()
-    
+
     def force_checkpoint(self) -> None:
-        """Force a checkpoint at current journal head."""
-        self.journal.write_checkpoint(self.superblock.checkpoint_txid)
-        self.disk.flush()
+        if self.journal.uncheckpointed:
+            self.journal.checkpoint()
 
 
-def run_recovery(
-    disk: VirtualDisk,
-    superblock: Superblock,
-    journal: Journal,
-    inode_table: InodeTable,
-    block_allocator: BlockAllocator,
-    run_checker: bool = True
-) -> RecoveryResult:
-    """Convenience function to run recovery."""
-    manager = RecoveryManager(disk, superblock, journal, inode_table, block_allocator)
-    return manager.recover(run_checker=run_checker)
+def run_recovery(disk, superblock, journal, inode_table, block_allocator,
+                 run_checker: bool = True) -> RecoveryResult:
+    return RecoveryManager(disk, superblock, journal, inode_table,
+                           block_allocator).recover(run_checker=run_checker)

@@ -1,99 +1,100 @@
 """
 Journal Module
 
-Implements write-ahead journaling with transaction records, checksums, and commit records.
+Write-ahead *redo* journal for metadata.
+
+On-disk layout of one transaction inside the circular journal region
+(block numbers are journal-relative, the ring wraps modulo journal_blocks):
+
+    block s      : TRANS_BEGIN record, then TRANS_DATA records back to back
+    ...            (records may straddle block boundaries; the tail of the
+                    last block is zero padding)
+    block s+m    : TRANS_COMMIT record (always starts on a fresh block, so
+                    writing the commit never rewrites blocks that hold data
+                    records)
+
+Every record is  [txid u64 | type u16 | flags u16 | length u32 | crc64 u64]
+followed by `length` payload bytes; the crc covers header fields + payload.
+
+Recovery does NOT trust the superblock's journal_head.  It starts at
+journal_tail, expects txid == checkpoint_txid + 1, and follows the chain
+until a record is missing, corrupt, out of sequence or a transaction has no
+valid commit record.  Stale records left over from earlier laps of the ring
+are rejected because their txids are not the expected next txid.
 """
 
 import struct
 import time
 from dataclasses import dataclass, field
-from typing import List, Optional, Iterator, Tuple
 from enum import IntEnum
-from .virtual_disk import VirtualDisk
+from typing import Any, Dict, List, Optional, Tuple
+
 from .superblock import Superblock, crc64
+from .virtual_disk import CrashPoint, VirtualDisk
 
 
 class RecordType(IntEnum):
-    """Journal record types."""
     TRANS_BEGIN = 0x0001
     TRANS_DATA = 0x0002
     TRANS_COMMIT = 0x0003
     TRANS_ABORT = 0x0004
-    CHECKPOINT = 0x0005
+    CHECKPOINT = 0x0005  # legacy: no longer written, still decodable
 
 
 class JournalError(Exception):
-    """Base exception for journal errors."""
     pass
 
 
 class JournalFullError(JournalError):
-    """Raised when journal has no space."""
     pass
 
 
 class InvalidRecordError(JournalError):
-    """Raised when journal record is invalid."""
     pass
 
 
 class CorruptRecordError(JournalError):
-    """Raised when journal record checksum fails."""
     pass
 
 
-# Journal record header format
-JOURNAL_HEADER_SIZE = 24
-# <QHHIIQ = txid(8) + type(2) + flags(2) + length(4) + checksum(8) = 24
+JOURNAL_HEADER_SIZE = 24  # <QHHIQ
+
 
 @dataclass
-@dataclass
 class JournalRecord:
-    """Base journal record."""
     txid: int
     record_type: RecordType = RecordType.TRANS_DATA
     flags: int = 0
-    payload: bytes = b''
-    
+    payload: bytes = b""
+
     def compute_checksum(self) -> int:
-        """Compute checksum of header + payload."""
-        header = struct.pack('<QHHI', self.txid, self.record_type, self.flags, len(self.payload))
+        header = struct.pack("<QHHI", self.txid, self.record_type, self.flags, len(self.payload))
         return crc64(header + self.payload)
-    
+
     def to_bytes(self) -> bytes:
-        """Serialize record to bytes."""
-        checksum = self.compute_checksum()
-        header = struct.pack('<QHHIQ', self.txid, self.record_type, self.flags, len(self.payload), checksum)
+        header = struct.pack("<QHHIQ", self.txid, self.record_type, self.flags,
+                             len(self.payload), self.compute_checksum())
         return header + self.payload
-    
+
     @classmethod
-    def from_bytes(cls, data: bytes) -> 'JournalRecord':
-        """Deserialize record from bytes."""
+    def from_bytes(cls, data: bytes) -> "JournalRecord":
         if len(data) < JOURNAL_HEADER_SIZE:
             raise InvalidRecordError(f"Record too short: {len(data)} < {JOURNAL_HEADER_SIZE}")
-        
-        # Check for empty record (all zeros)
-        if all(b == 0 for b in data[:JOURNAL_HEADER_SIZE]):
+        if not any(data[:JOURNAL_HEADER_SIZE]):
             raise InvalidRecordError("Empty record (end of journal)")
-        
-        txid, rec_type, flags, length, checksum = struct.unpack('<QHHIQ', data[:JOURNAL_HEADER_SIZE])
-        
-        # Validate record type
+        txid, rec_type, flags, length, checksum = struct.unpack(
+            "<QHHIQ", data[:JOURNAL_HEADER_SIZE])
         if rec_type not in [rt.value for rt in RecordType]:
             raise InvalidRecordError(f"Invalid record type: {rec_type}")
-        
         if len(data) < JOURNAL_HEADER_SIZE + length:
-            raise InvalidRecordError(f"Record payload truncated: need {length}, have {len(data) - JOURNAL_HEADER_SIZE}")
-        
+            raise InvalidRecordError(
+                f"Record payload truncated: need {length}, have {len(data) - JOURNAL_HEADER_SIZE}")
         payload = data[JOURNAL_HEADER_SIZE:JOURNAL_HEADER_SIZE + length]
-        
-        # Verify checksum
-        record = cls(txid, RecordType(rec_type), flags, payload)
+        record = JournalRecord(txid, RecordType(rec_type), flags, payload)
         if record.compute_checksum() != checksum:
             raise CorruptRecordError(f"Checksum mismatch for txid {txid}")
-        
         return record
-    
+
     @property
     def total_size(self) -> int:
         return JOURNAL_HEADER_SIZE + len(self.payload)
@@ -101,148 +102,157 @@ class JournalRecord:
 
 @dataclass
 class TransBeginRecord(JournalRecord):
-    """Transaction begin record."""
     timestamp: int = 0
-    
+
     def __post_init__(self):
         self.record_type = RecordType.TRANS_BEGIN
-        self.payload = struct.pack('<QQ', self.txid, self.timestamp)
-    
+        self.payload = struct.pack("<QQ", self.txid, self.timestamp)
+
     @classmethod
-    def from_bytes(cls, data: bytes) -> 'TransBeginRecord':
+    def from_bytes(cls, data: bytes) -> "TransBeginRecord":
         base = JournalRecord.from_bytes(data)
         if base.record_type != RecordType.TRANS_BEGIN:
             raise InvalidRecordError("Not a TRANS_BEGIN record")
         if len(base.payload) != 16:
             raise InvalidRecordError(f"Invalid TRANS_BEGIN payload size: {len(base.payload)}")
-        txid, timestamp = struct.unpack('<QQ', base.payload)
+        txid, timestamp = struct.unpack("<QQ", base.payload)
+        if txid != base.txid:
+            raise InvalidRecordError("TRANS_BEGIN txid mismatch")
         return cls(txid=txid, timestamp=timestamp)
 
 
 @dataclass
 class TransDataRecord(JournalRecord):
-    """Transaction data record (metadata after-image)."""
+    """Metadata after-image: bytes [offset, offset+length) of target_block."""
     target_block: int = 0
     offset: int = 0
     length: int = 0
-    after_image: bytes = b''
-    
+    after_image: bytes = b""
+
     def __post_init__(self):
         self.record_type = RecordType.TRANS_DATA
-        self.payload = struct.pack('<QII', self.target_block, self.offset, self.length) + self.after_image
-    
+        self.payload = struct.pack("<QII", self.target_block, self.offset, self.length) + self.after_image
+
     @classmethod
-    def from_bytes(cls, data: bytes) -> 'TransDataRecord':
+    def from_bytes(cls, data: bytes) -> "TransDataRecord":
         base = JournalRecord.from_bytes(data)
         if base.record_type != RecordType.TRANS_DATA:
             raise InvalidRecordError("Not a TRANS_DATA record")
         if len(base.payload) < 16:
             raise InvalidRecordError(f"Invalid TRANS_DATA payload size: {len(base.payload)}")
-        target_block, offset, length = struct.unpack('<QII', base.payload[:16])
+        target_block, offset, length = struct.unpack("<QII", base.payload[:16])
         after_image = base.payload[16:]
         if len(after_image) != length:
             raise InvalidRecordError(f"After-image length mismatch: {len(after_image)} != {length}")
-        return cls(
-            txid=base.txid,
-            flags=base.flags,
-            target_block=target_block,
-            offset=offset,
-            length=length,
-            after_image=after_image
-        )
+        return cls(txid=base.txid, flags=base.flags, target_block=target_block,
+                   offset=offset, length=length, after_image=after_image)
 
 
 @dataclass
 class TransCommitRecord(JournalRecord):
-    """Transaction commit record."""
-    
+    """
+    Commit record.  Payload: txid u64 + number of DATA records u32.  The
+    count lets recovery detect a commit whose data records are missing.
+    Legacy 8-byte payloads (no count) are still accepted (num_records = -1).
+    """
+    num_records: int = -1
+
     def __post_init__(self):
         self.record_type = RecordType.TRANS_COMMIT
-        self.payload = struct.pack('<Q', self.txid)
-    
+        if self.num_records >= 0:
+            self.payload = struct.pack("<QI", self.txid, self.num_records)
+        else:
+            self.payload = struct.pack("<Q", self.txid)
+
     @classmethod
-    def from_bytes(cls, data: bytes) -> 'TransCommitRecord':
+    def from_bytes(cls, data: bytes) -> "TransCommitRecord":
         base = JournalRecord.from_bytes(data)
         if base.record_type != RecordType.TRANS_COMMIT:
             raise InvalidRecordError("Not a TRANS_COMMIT record")
-        if len(base.payload) != 8:
+        if len(base.payload) == 8:
+            txid = struct.unpack("<Q", base.payload)[0]
+            n = -1
+        elif len(base.payload) == 12:
+            txid, n = struct.unpack("<QI", base.payload)
+        else:
             raise InvalidRecordError(f"Invalid TRANS_COMMIT payload size: {len(base.payload)}")
-        txid = struct.unpack('<Q', base.payload)[0]
-        return cls(txid=txid)
+        if txid != base.txid:
+            raise InvalidRecordError("TRANS_COMMIT txid mismatch")
+        return cls(txid=txid, num_records=n)
 
 
 @dataclass
 class CheckpointRecord(JournalRecord):
-    """Checkpoint record."""
+    """Legacy checkpoint record (the superblock is now the checkpoint)."""
     checkpoint_txid: int = 0
     journal_head: int = 0
     journal_tail: int = 0
-    
+
     def __post_init__(self):
         self.record_type = RecordType.CHECKPOINT
-        self.payload = struct.pack('<QQQ', self.checkpoint_txid, self.journal_head, self.journal_tail)
-    
+        self.payload = struct.pack("<QQQ", self.checkpoint_txid, self.journal_head, self.journal_tail)
+
     @classmethod
-    def from_bytes(cls, data: bytes) -> 'CheckpointRecord':
+    def from_bytes(cls, data: bytes) -> "CheckpointRecord":
         base = JournalRecord.from_bytes(data)
         if base.record_type != RecordType.CHECKPOINT:
             raise InvalidRecordError("Not a CHECKPOINT record")
         if len(base.payload) != 24:
             raise InvalidRecordError(f"Invalid CHECKPOINT payload size: {len(base.payload)}")
-        checkpoint_txid, journal_head, journal_tail = struct.unpack('<QQQ', base.payload)
-        return cls(
-            txid=base.txid,
-            checkpoint_txid=checkpoint_txid,
-            journal_head=journal_head,
-            journal_tail=journal_tail
-        )
+        c, h, t = struct.unpack("<QQQ", base.payload)
+        return cls(txid=base.txid, checkpoint_txid=c, journal_head=h, journal_tail=t)
 
 
 @dataclass
 class Transaction:
     """In-memory transaction representation."""
     txid: int
-    records: List[JournalRecord] = field(default_factory=list)
+    records: List[TransDataRecord] = field(default_factory=list)
     committed: bool = False
     aborted: bool = False
     timestamp: int = field(default_factory=time.time_ns)
-    
+    start_block: int = -1       # journal-relative block of BEGIN (set on write/scan)
+    commit_block: int = -1      # journal-relative block of COMMIT
+
     def add_data_record(self, target_block: int, offset: int, data: bytes) -> None:
-        """Add a metadata after-image record."""
-        record = TransDataRecord(
-            txid=self.txid,
-            target_block=target_block,
-            offset=offset,
-            length=len(data),
-            after_image=data
-        )
-        self.records.append(record)
-    
+        self.records.append(TransDataRecord(
+            txid=self.txid, target_block=target_block, offset=offset,
+            length=len(data), after_image=data))
+
     def get_begin_record(self) -> TransBeginRecord:
         return TransBeginRecord(txid=self.txid, timestamp=self.timestamp)
-    
+
     def get_commit_record(self) -> TransCommitRecord:
-        return TransCommitRecord(txid=self.txid)
-    
+        return TransCommitRecord(txid=self.txid, num_records=len(self.records))
+
+    def get_journal_data_records(self) -> List[JournalRecord]:
+        return [self.get_begin_record()] + list(self.records)
+
     def get_all_records(self) -> List[JournalRecord]:
-        """Get all records in order: BEGIN, DATA..., COMMIT."""
-        result = [self.get_begin_record()]
-        result.extend(self.records)
-        result.append(self.get_commit_record())
-        return result
-    
+        return [self.get_begin_record()] + list(self.records) + [self.get_commit_record()]
+
     def estimate_size(self) -> int:
-        """Estimate total journal space needed."""
-        size = JOURNAL_HEADER_SIZE + 16  # BEGIN
-        for rec in self.records:
-            size += rec.total_size
-        size += JOURNAL_HEADER_SIZE + 8  # COMMIT
+        size = JOURNAL_HEADER_SIZE + 16
+        size += sum(r.total_size for r in self.records)
+        size += JOURNAL_HEADER_SIZE + 12
         return size
+
+    def blocks_touched(self) -> List[int]:
+        return sorted({r.target_block for r in self.records})
+
+
+@dataclass
+class ScanResult:
+    committed: List[Transaction] = field(default_factory=list)
+    end_block: int = 0                      # journal-relative block after last committed tx
+    incomplete: List[Dict[str, Any]] = field(default_factory=list)
+    warnings: List[str] = field(default_factory=list)
+    errors: List[str] = field(default_factory=list)
 
 
 class Journal:
-    """Manages the write-ahead journal."""
-    
+    """Manages the circular write-ahead journal."""
+
     def __init__(self, disk: VirtualDisk, superblock: Superblock):
         self.disk = disk
         self.superblock = superblock
@@ -250,252 +260,378 @@ class Journal:
         self.journal_blocks = superblock.journal_block_count
         self.block_size = superblock.block_size
         self.journal_size = self.journal_blocks * self.block_size
-        self._next_txid = 1
-        self._crash_callback = None
-    
-    def set_crash_callback(self, callback) -> None:
-        """Set crash injection callback."""
-        self._crash_callback = callback
-    
-    def _maybe_crash(self, point) -> None:
-        if self._crash_callback:
-            self._crash_callback(point)
-    
-    def _get_journal_offset(self, relative_block: int, offset: int) -> int:
-        """Convert journal-relative position to absolute disk offset."""
-        abs_block = self.journal_start + relative_block
-        return abs_block * self.block_size + offset
-    
-    def _read_journal_bytes(self, start_block: int, count: int) -> bytes:
-        """Read raw bytes from journal region."""
-        abs_start = self.journal_start + start_block
-        return self.disk.read_blocks(abs_start, count)
-    
-    def _write_journal_bytes(self, start_block: int, data: bytes) -> None:
-        """Write raw bytes to journal region."""
-        abs_start = self.journal_start + start_block
-        self.disk.write_blocks(abs_start, data)
-    
+        # in-memory ring state (persisted tail/checkpoint live in the superblock)
+        self.tail = superblock.journal_tail
+        self.head = superblock.journal_tail
+        self.checkpoint_txid = superblock.checkpoint_txid
+        self.uncheckpointed: List[int] = []
+        self._next_txid = superblock.checkpoint_txid + 1
+        self.events = None  # optional EventLog
+
+    # ----------------------------------------------------------- utilities
+    def _emit(self, kind: str, message: str = "", **kw) -> None:
+        if self.events is not None:
+            self.events.emit(kind, message, **kw)
+
+    def _fire(self, point: CrashPoint, info: Optional[dict] = None) -> None:
+        self.disk.fire(point, info)
+
+    def set_crash_callback(self, callback) -> None:  # kept for API compat
+        self.disk.set_crash_callback(callback)
+
+    def _abs(self, rel_block: int) -> int:
+        return self.journal_start + (rel_block % self.journal_blocks)
+
+    # -------------------------------------------------------------- txids
     def get_next_txid(self) -> int:
-        """Get next transaction ID."""
         txid = self._next_txid
         self._next_txid += 1
         return txid
-    
+
+    def release_txid(self, txid: int) -> None:
+        """Give back the most recent txid after an aborted transaction."""
+        if self._next_txid == txid + 1:
+            self._next_txid = txid
+
     def set_next_txid(self, txid: int) -> None:
-        """Set next transaction ID (for recovery)."""
+        """Ensure the next txid is greater than ``txid``."""
         self._next_txid = max(self._next_txid, txid + 1)
-    
-    def write_transaction(self, transaction: Transaction) -> None:
-        """
-        Write a complete transaction to the journal.
-        
-        This writes all records sequentially, handling block boundaries.
-        """
-        records = transaction.get_all_records()
-        
-        # Check space
-        total_size = sum(r.total_size for r in records)
-        free_space = self.get_free_space()
-        if total_size > free_space:
-            raise JournalFullError(f"Transaction needs {total_size} bytes, only {free_space} available")
-        
-        # Write records
-        head = self.superblock.journal_head
-        offset = 0
-        
-        for record in records:
-            record_bytes = record.to_bytes()
-            rec_size = len(record_bytes)
-            
-            while rec_size > 0:
-                # Space in current block
-                block_offset = head * self.block_size + offset
-                space_in_block = self.block_size - offset
-                
-                if rec_size <= space_in_block:
-                    # Fits in current block
-                    self._write_partial_record(head, offset, record_bytes)
-                    offset += rec_size
-                    rec_size = 0
-                else:
-                    # Fill current block, move to next
-                    self._write_partial_record(head, offset, record_bytes[:space_in_block])
-                    rec_size -= space_in_block
-                    record_bytes = record_bytes[space_in_block:]
-                    
-                    # Move to next block
-                    head = (head + 1) % self.journal_blocks
-                    offset = 0
-                    
-                    # Check for wraparound collision with tail
-                    if head == self.superblock.journal_tail:
-                        raise JournalFullError("Journal wraparound would overwrite uncheckpointed transactions")
-        
-        # Update journal head
-        self.superblock.journal_head = head
-        self.superblock._dirty = True
-        
-        self._maybe_crash('after_journal_write')
-    
-    def _write_partial_record(self, rel_block: int, offset: int, data: bytes) -> None:
-        """Write partial record data to journal block."""
-        abs_block = self.journal_start + rel_block
-        block_data = bytearray(self.disk.read_block(abs_block))
-        block_data[offset:offset + len(data)] = data
-        self.disk.write_block(abs_block, bytes(block_data))
-    
-    def flush_journal(self) -> None:
-        """Flush journal writes to disk."""
-        self.disk.flush()
-        self._maybe_crash('after_journal_flush')
-    
-    def write_checkpoint(self, checkpoint_txid: int) -> None:
-        """Write a checkpoint record."""
-        record = CheckpointRecord(
-            txid=0,  # Checkpoints don't have txid
-            checkpoint_txid=checkpoint_txid,
-            journal_head=self.superblock.journal_head,
-            journal_tail=self.superblock.journal_tail
-        )
-        
-        # Write at current head
-        head = self.superblock.journal_head
-        record_bytes = record.to_bytes()
-        
-        if len(record_bytes) > self.block_size:
-            raise JournalError("Checkpoint record too large")
-        
-        self._write_partial_record(head, 0, record_bytes)
-        self.superblock.journal_head = (head + 1) % self.journal_blocks
-        self.superblock.journal_tail = self.superblock.journal_head
-        self.superblock.checkpoint_txid = checkpoint_txid
-        self.superblock._dirty = True
-        
-        self.disk.flush()
-        self._maybe_crash('after_checkpoint')
-    
+
+    # -------------------------------------------------------------- space
+    def used_blocks(self) -> int:
+        return (self.head - self.tail) % self.journal_blocks
+
+    def free_blocks(self) -> int:
+        return self.journal_blocks - 1 - self.used_blocks()   # one block reserved
+
     def get_free_space(self) -> int:
-        """Get free space in journal (bytes)."""
-        head = self.superblock.journal_head
-        tail = self.superblock.journal_tail
-        
-        if head >= tail:
-            used = (head - tail) * self.block_size
-        else:
-            used = (head + self.journal_blocks - tail) * self.block_size
-        
-        return self.journal_size - used - self.block_size  # Reserve 1 block
-    
+        return self.free_blocks() * self.block_size
+
+    def _data_stream(self, tx: Transaction) -> bytes:
+        stream = b"".join(r.to_bytes() for r in tx.get_journal_data_records())
+        pad = (-len(stream)) % self.block_size
+        return stream + b"\x00" * pad
+
+    def blocks_needed(self, tx: Transaction) -> int:
+        n = len(self._data_stream(tx)) // self.block_size
+        return n + 1  # + commit block
+
+    def reserve(self, tx: Transaction) -> None:
+        """Make sure the transaction fits, checkpointing if that helps."""
+        need = self.blocks_needed(tx)
+        if need > self.journal_blocks - 1:
+            raise JournalFullError(
+                f"Transaction needs {need} journal blocks but the journal only holds "
+                f"{self.journal_blocks - 1}")
+        if need > self.free_blocks() and self.uncheckpointed:
+            self.checkpoint()
+        if need > self.free_blocks():
+            raise JournalFullError(
+                f"Transaction needs {need} journal blocks, only {self.free_blocks()} free")
+
+    # --------------------------------------------------------- write path
+    def write_transaction(self, transaction: Transaction) -> Tuple[int, int]:
+        """
+        Write BEGIN + DATA records (no commit) at the journal head.
+        Returns (commit_block, 0): where the commit record belongs.
+        """
+        need = self.blocks_needed(transaction)
+        if need > self.free_blocks():
+            raise JournalFullError(
+                f"Transaction needs {need} blocks, only {self.free_blocks()} free")
+        self._fire(CrashPoint.BEFORE_JOURNAL_WRITE)
+        stream = self._data_stream(transaction)
+        nblocks = len(stream) // self.block_size
+        transaction.start_block = self.head
+        for i in range(nblocks):
+            self.disk.write_block(self._abs(self.head + i),
+                                  stream[i * self.block_size:(i + 1) * self.block_size])
+        transaction.commit_block = (self.head + nblocks) % self.journal_blocks
+        self._fire(CrashPoint.AFTER_JOURNAL_WRITE)
+        self._emit("journal_write",
+                   f"tx {transaction.txid}: {len(transaction.records)} data record(s) written "
+                   f"to journal blocks {transaction.start_block}..{(transaction.commit_block - 1) % self.journal_blocks}",
+                   txid=transaction.txid, start_block=transaction.start_block,
+                   blocks=nblocks, records=len(transaction.records))
+        return transaction.commit_block, 0
+
+    def flush_journal(self) -> None:
+        self._fire(CrashPoint.BEFORE_JOURNAL_FLUSH)
+        self.disk.flush("journal")
+        self._fire(CrashPoint.AFTER_JOURNAL_FLUSH)
+        self._emit("journal_flush", "journal blocks flushed to stable storage")
+
+    def write_commit(self, transaction: Transaction) -> None:
+        """Write the commit record into its own block (not yet durable)."""
+        if transaction.commit_block < 0:
+            raise JournalError("write_commit before write_transaction")
+        self._fire(CrashPoint.BEFORE_COMMIT_WRITE)
+        raw = transaction.get_commit_record().to_bytes()
+        block = raw + b"\x00" * (self.block_size - len(raw))
+        self.disk.write_block(self._abs(transaction.commit_block), block)
+        self._fire(CrashPoint.AFTER_COMMIT_WRITE)
+        self._emit("commit_write", f"tx {transaction.txid}: commit record written to journal block "
+                   f"{transaction.commit_block} (not yet durable)", txid=transaction.txid,
+                   block=transaction.commit_block)
+
+    def flush_commit(self) -> None:
+        self._fire(CrashPoint.BEFORE_COMMIT_FLUSH)
+        self.disk.flush("commit")
+        self._fire(CrashPoint.AFTER_COMMIT_FLUSH)
+
+    def mark_committed(self, transaction: Transaction) -> None:
+        """Called once the commit record is durable: the ring head advances."""
+        transaction.committed = True
+        self.head = (transaction.commit_block + 1) % self.journal_blocks
+        self.uncheckpointed.append(transaction.txid)
+
+    def checkpoint(self, txid: Optional[int] = None, phase: str = "checkpoint") -> None:
+        """
+        Persist the new journal tail / checkpoint txid in the superblock.
+
+        PRECONDITION (the caller's job): every committed transaction up to
+        ``txid`` has been applied to its home location AND those home blocks
+        have been flushed.  Only then may journal space be reclaimed.
+        """
+        if txid is None:
+            txid = self.uncheckpointed[-1] if self.uncheckpointed else self.checkpoint_txid
+        self._fire(CrashPoint.BEFORE_CHECKPOINT)
+        # Build the image from the COMMITTED on-disk superblock (not the in-memory
+        # one, which may already contain the uncommitted counts of a running tx).
+        disk_sb = Superblock.from_bytes(self.disk.read_block(0))
+        disk_sb.journal_tail = self.head
+        disk_sb.journal_head = self.head
+        disk_sb.checkpoint_txid = txid
+        disk_sb._checksum = disk_sb.compute_checksum()
+        self.disk.write_block(0, disk_sb.to_bytes(include_checksum=True))
+        self.disk.flush(phase)
+        sb = self.superblock
+        sb.journal_tail = self.head
+        sb.journal_head = self.head
+        sb.checkpoint_txid = txid
+        self.tail = self.head
+        self.checkpoint_txid = txid
+        self.uncheckpointed = [t for t in self.uncheckpointed if t > txid]
+        self._fire(CrashPoint.AFTER_CHECKPOINT)
+        self._emit("checkpoint", f"checkpoint: txid <= {txid} safely applied; journal tail -> block {self.tail}",
+                   txid=txid, tail=self.tail)
+
+    write_checkpoint = checkpoint  # legacy name
+
+    # ----------------------------------------------------------- scanning
+    def _ring_bytes(self) -> bytes:
+        return self.disk.read_blocks(self.journal_start, self.journal_blocks)
+
+    def _ring_read(self, ring: bytes, off: int, n: int) -> bytes:
+        total = len(ring)
+        off %= total
+        if off + n <= total:
+            return ring[off:off + n]
+        return ring[off:] + ring[:(off + n) - total]
+
+    def _try_record(self, ring: bytes, off: int) -> Tuple[Optional[JournalRecord], str]:
+        """Parse one record at a ring byte offset.  Returns (record, '') or (None, reason)."""
+        hdr = self._ring_read(ring, off, JOURNAL_HEADER_SIZE)
+        if not any(hdr):
+            return None, "empty"
+        try:
+            length = struct.unpack("<QHHIQ", hdr)[3]
+        except struct.error:
+            return None, "corrupt"
+        if length > len(ring):
+            return None, "corrupt"
+        try:
+            rec = JournalRecord.from_bytes(self._ring_read(ring, off, JOURNAL_HEADER_SIZE + length))
+        except CorruptRecordError:
+            return None, "checksum"
+        except InvalidRecordError:
+            return None, "invalid"
+        return rec, ""
+
+    def _validate_data_record(self, rec: TransDataRecord) -> Optional[str]:
+        sb = self.superblock
+        if rec.length <= 0:
+            return "zero-length after-image"
+        if rec.offset + rec.length > self.block_size:
+            return f"after-image [{rec.offset},{rec.offset + rec.length}) exceeds block size"
+        if rec.target_block >= sb.total_blocks:
+            return f"target block {rec.target_block} beyond end of disk"
+        if self.journal_start <= rec.target_block < self.journal_start + self.journal_blocks:
+            return f"target block {rec.target_block} lies inside the journal region"
+        return None
+
+    def _parse_tx_at(self, ring: bytes, block: int, expect_txid: Optional[int]
+                     ) -> Tuple[Optional[Transaction], str, int]:
+        """
+        Parse one transaction chain starting at ring block ``block``.
+        Returns (tx, status, blocks_consumed); status is 'committed', 'no-begin',
+        'out-of-sequence' (benign), or a description of why the tx is incomplete/corrupt.
+        """
+        bs = self.block_size
+        off = block * bs
+        rec, why = self._try_record(ring, off)
+        if rec is None:
+            return None, ("end" if why == "empty" else f"bad-begin:{why}"), 0
+        if rec.record_type != RecordType.TRANS_BEGIN:
+            return None, "no-begin", 0
+        if expect_txid is not None and rec.txid != expect_txid:
+            return None, "out-of-sequence", 0
+        try:
+            begin = TransBeginRecord.from_bytes(self._ring_read(ring, off, rec.total_size))
+        except JournalError:
+            return None, "bad-begin:invalid", 0
+        tx = Transaction(txid=begin.txid, timestamp=begin.timestamp, start_block=block)
+        off += rec.total_size
+        total = len(ring)
+        limit = off + total  # never walk further than one lap
+        while True:
+            if off >= limit:
+                return tx, "incomplete: ran past one journal lap", 0
+            if off % bs != 0:
+                rest = bs - (off % bs)
+                if not any(self._ring_read(ring, off, rest)):
+                    off += rest  # zero padding -> next block boundary
+            rec, why = self._try_record(ring, off)
+            if rec is None:
+                reason = {"empty": "no commit record (journal ends)",
+                          "checksum": "corrupt record (checksum mismatch)",
+                          "invalid": "corrupt record (invalid header)",
+                          "corrupt": "corrupt record"}[why]
+                return tx, f"incomplete: {reason}", 0
+            if rec.txid != tx.txid:
+                return tx, f"incomplete: record of tx {rec.txid} inside tx {tx.txid}", 0
+            if rec.record_type == RecordType.TRANS_DATA:
+                try:
+                    data = TransDataRecord.from_bytes(self._ring_read(ring, off, rec.total_size))
+                except JournalError as e:
+                    return tx, f"incomplete: bad data record ({e})", 0
+                problem = self._validate_data_record(data)
+                if problem:
+                    return tx, f"invalid: {problem}", 0
+                tx.records.append(data)
+                off += rec.total_size
+                continue
+            if rec.record_type == RecordType.TRANS_COMMIT:
+                try:
+                    commit = TransCommitRecord.from_bytes(self._ring_read(ring, off, rec.total_size))
+                except JournalError as e:
+                    return tx, f"incomplete: bad commit record ({e})", 0
+                if commit.num_records >= 0 and commit.num_records != len(tx.records):
+                    return tx, (f"incomplete: commit says {commit.num_records} data records, "
+                                f"found {len(tx.records)}"), 0
+                tx.committed = True
+                tx.commit_block = (off // bs) % self.journal_blocks
+                end_off = off + rec.total_size
+                consumed_blocks = (end_off - 1) // bs + 1 - block
+                return tx, "committed", consumed_blocks
+            return tx, f"incomplete: unexpected record type {rec.record_type.name}", 0
+
+    def scan(self) -> ScanResult:
+        """Find every valid committed, not-yet-checkpointed transaction."""
+        res = ScanResult()
+        ring = self._ring_bytes()
+        pos = self.superblock.journal_tail
+        expect = self.superblock.checkpoint_txid + 1
+        consumed = 0
+        res.end_block = pos
+        while consumed < self.journal_blocks - 1:
+            tx, status, blocks = self._parse_tx_at(ring, pos, expect)
+            if status == "committed":
+                res.committed.append(tx)
+                pos = (tx.commit_block + 1) % self.journal_blocks
+                consumed += blocks
+                expect += 1
+                res.end_block = pos
+                continue
+            if status.startswith("invalid:"):
+                res.errors.append(f"tx {tx.txid} at journal block {pos}: {status[8:].strip()}")
+                res.incomplete.append({"txid": tx.txid, "start_block": pos, "reason": status})
+            elif status.startswith("incomplete"):
+                res.incomplete.append({"txid": tx.txid, "start_block": pos, "reason": status})
+                if "corrupt" in status:
+                    res.warnings.append(
+                        f"tx {tx.txid} at journal block {pos}: {status} - transaction discarded")
+            elif status.startswith("bad-begin"):
+                res.warnings.append(
+                    f"journal block {pos}: unreadable record where tx {expect} was expected "
+                    f"({status.split(':')[1]}) - treated as end of journal")
+            # 'end', 'no-begin', 'out-of-sequence' => normal end of the live log
+            break
+        return res
+
     def scan_transactions(self, from_tail: bool = True) -> List[Transaction]:
+        """Committed, not-yet-checkpointed transactions in order (API kept for callers)."""
+        return self.scan().committed
+
+    # ------------------------------------------------------------- replay
+    def replay_transaction(self, transaction: Transaction, flush: bool = True) -> None:
+        """Redo a committed transaction's patches onto the home locations (idempotent)."""
+        for rec in transaction.records:
+            problem = self._validate_data_record(rec)
+            if problem:
+                raise JournalError(f"tx {transaction.txid}: {problem}")
+            block = bytearray(self.disk.read_block(rec.target_block))
+            block[rec.offset:rec.offset + rec.length] = rec.after_image
+            self.disk.write_block(rec.target_block, bytes(block))
+        if flush:
+            self.disk.flush("recovery")
+
+    # ------------------------------------------------------- introspection
+    def scan_region(self) -> List[Dict[str, Any]]:
         """
-        Scan journal for complete transactions.
-        
-        Args:
-            from_tail: If True, start from journal_tail (checkpoint). 
-                      If False, start from beginning of journal.
-        
-        Returns:
-            List of committed transactions in order.
+        Forensic decode of the whole journal region: every transaction chain
+        that parses, whether or not it is live.  Pure read of on-disk bytes.
         """
-        start_block = self.superblock.journal_tail if from_tail else 0
-        start_offset = 0
-        
-        # Read entire journal
-        journal_data = self._read_journal_bytes(0, self.journal_blocks)
-        
-        transactions = []
-        current_tx: Optional[Transaction] = None
-        offset = start_block * self.block_size + start_offset
-        
-        # Scan through journal
-        while offset < len(journal_data):
-            # Check if we have enough for a header
-            if offset + JOURNAL_HEADER_SIZE > len(journal_data):
-                break
-            
-            # Try to read record
-            try:
-                record = JournalRecord.from_bytes(journal_data[offset:])
-            except (InvalidRecordError, CorruptRecordError, struct.error):
-                # Invalid/truncated record - stop scanning
-                break
-            
-            offset += record.total_size
-            
-            # Handle record
-            if record.record_type == RecordType.TRANS_BEGIN:
-                if current_tx is not None:
-                    # Previous transaction incomplete - discard
-                    pass
-                begin_rec = TransBeginRecord.from_bytes(journal_data[offset - record.total_size:offset])
-                current_tx = Transaction(txid=begin_rec.txid, timestamp=begin_rec.timestamp)
-                self.set_next_txid(begin_rec.txid)
-            
-            elif record.record_type == RecordType.TRANS_DATA:
-                if current_tx is not None:
-                    data_rec = TransDataRecord.from_bytes(journal_data[offset - record.total_size:offset])
-                    current_tx.records.append(data_rec)
-            
-            elif record.record_type == RecordType.TRANS_COMMIT:
-                if current_tx is not None:
-                    commit_rec = TransCommitRecord.from_bytes(journal_data[offset - record.total_size:offset])
-                    if commit_rec.txid == current_tx.txid:
-                        current_tx.committed = True
-                        transactions.append(current_tx)
-                    current_tx = None
-            
-            elif record.record_type == RecordType.TRANS_ABORT:
-                if current_tx is not None:
-                    current_tx.aborted = True
-                    current_tx = None
-            
-            elif record.record_type == RecordType.CHECKPOINT:
-                # Update scan position
-                cp_rec = CheckpointRecord.from_bytes(journal_data[offset - record.total_size:offset])
-                self.superblock.checkpoint_txid = cp_rec.checkpoint_txid
-        
-        return transactions
-    
-    def replay_transaction(self, transaction: Transaction) -> None:
-        """Replay a committed transaction's data records to home locations."""
-        for record in transaction.records:
-            if record.record_type == RecordType.TRANS_DATA:
-                data_rec = record  # type: TransDataRecord
-                # Read home block
-                block_data = bytearray(self.disk.read_block(data_rec.target_block))
-                # Apply after-image
-                end = data_rec.offset + data_rec.length
-                if end > len(block_data):
-                    raise JournalError(f"After-image exceeds block: {end} > {len(block_data)}")
-                block_data[data_rec.offset:end] = data_rec.after_image
-                # Write back
-                self.disk.write_block(data_rec.target_block, bytes(block_data))
-        
-        # Flush home blocks
-        self.disk.flush()
-    
+        ring = self._ring_bytes()
+        out: List[Dict[str, Any]] = []
+        covered = set()
+        for b in range(self.journal_blocks):
+            if b in covered:
+                continue
+            tx, status, blocks = self._parse_tx_at(ring, b, None)
+            if tx is None:
+                continue
+            if status == "committed":
+                nblocks = blocks
+            else:
+                nblocks = max(1, len(self._data_stream(tx)) // self.block_size)
+            for i in range(nblocks):
+                covered.add((b + i) % self.journal_blocks)
+            ckpt = self.superblock.checkpoint_txid
+            if status == "committed":
+                state = "checkpointed" if tx.txid <= ckpt else "committed-pending-replay"
+            else:
+                state = "uncommitted"
+            out.append({
+                "txid": tx.txid,
+                "start_block": b,
+                "blocks": nblocks,
+                "committed": status == "committed",
+                "status": status,
+                "state": state,
+                "timestamp": tx.timestamp,
+                "records": [{"type": "TRANS_BEGIN", "crc_ok": True}] + [
+                    {"type": "TRANS_DATA", "target_block": r.target_block, "offset": r.offset,
+                     "length": r.length, "crc_ok": True} for r in tx.records
+                ] + ([{"type": "TRANS_COMMIT", "crc_ok": True, "block": tx.commit_block}]
+                     if status == "committed" else []),
+            })
+        out.sort(key=lambda t: t["txid"])
+        return out
+
     def get_journal_stats(self) -> dict:
-        """Get journal statistics."""
-        head = self.superblock.journal_head
-        tail = self.superblock.journal_tail
-        
-        if head >= tail:
-            used_blocks = head - tail
-        else:
-            used_blocks = head + self.journal_blocks - tail
-        
+        used = self.used_blocks()
         return {
-            'journal_blocks': self.journal_blocks,
-            'used_blocks': used_blocks,
-            'free_blocks': self.journal_blocks - used_blocks - 1,
-            'head': head,
-            'tail': tail,
-            'checkpoint_txid': self.superblock.checkpoint_txid,
-            'next_txid': self._next_txid,
+            "journal_blocks": self.journal_blocks,
+            "used_blocks": used,
+            "free_blocks": self.journal_blocks - used - 1,
+            "head": self.head,
+            "tail": self.tail,
+            "checkpoint_txid": self.checkpoint_txid,
+            "next_txid": self._next_txid,
+            "uncheckpointed": list(self.uncheckpointed),
         }
 
 
 def parse_record(data: bytes) -> JournalRecord:
-    """Parse a journal record from bytes (generic)."""
     return JournalRecord.from_bytes(data)

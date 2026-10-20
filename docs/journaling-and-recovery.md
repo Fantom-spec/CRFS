@@ -1,146 +1,73 @@
-# Journaling and Recovery Protocol
+# Journaling and Recovery
 
-## Transaction State Machine
+## What is logged
 
-```
-IDLE -> PREPARING -> JOURNAL_WRITING -> JOURNAL_FLUSHED -> COMMIT_WRITING -> COMMIT_FLUSHED -> APPLYING -> HOME_FLUSHED -> CHECKPOINTING -> IDLE
-                    |                  |                   |                  |              |               |
-                    v                  v                   v                  v              v               v
-                ABORTED            ABORTED             ABORTED            ABORTED        ABORTED       ABORTED
-```
+CRFS uses **redo journaling of metadata** (superblock counters, bitmap, inode table, directory blocks).
+File contents are written **copy-on-write** to freshly allocated blocks *before* the commit ("ordered
+mode"), so a committed inode never points at unwritten data and old file contents are never overwritten
+in place. Data is therefore not journaled.
 
-## Write Ordering Protocol
+Each journal `DATA` record is an absolute after-image of a byte range of one block, so replaying it twice
+gives the same result (idempotence).
 
-### Metadata Journaling (Redo Logging)
+## Commit protocol (the order is the whole point)
 
-For each filesystem operation that modifies metadata:
+| # | Step | Event kind | Disk call |
+|---|---|---|---|
+| 1 | PREPARE – operation runs on the staging overlay (`StagingIO`); data blocks written | `tx_begin`, `tx_prepare` | data blocks flushed |
+| 2 | JOURNAL WRITE – BEGIN + DATA records into the ring | `journal_write` | – |
+| 3 | FLUSH – journal blocks durable | `journal_flush` | `flush("journal")` |
+| 4 | COMMIT – commit record written alone in its block | `commit_write` | – |
+| 5 | COMMIT FLUSH – **commit point** | `commit_flush` | `flush("commit")` |
+| 6 | APPLY – after-images written to home locations | `home_apply` | – |
+| 7 | HOME FLUSH | `home_flush` | `flush("home")` |
+| 8 | CHECKPOINT – superblock tail / checkpoint txid advanced | `checkpoint` | `flush("checkpoint")` |
 
-1. **Begin Transaction**
-   - Allocate new transaction ID (monotonically increasing)
-   - Record start timestamp
-   - Write TRANS_BEGIN record to journal
+`abort` (any exception before step 4) discards the overlay, restores in-memory counters and frees
+nothing on disk, so nothing is left behind and the txid is reused.
 
-2. **Log Metadata Changes**
-   - For each metadata block to be modified:
-     - Compute after-image (entire block or modified portion)
-     - Write TRANS_DATA record with target block, offset, length, after-image
-   - Records are written sequentially in journal
+Crash points are fired before/after/in the middle of every one of these steps
+(`CrashPoint` in `src/virtual_disk.py`; the 14 scenarios are in `src/crash_injector.py`).
 
-3. **Flush Journal Records**
-   - `fsync()` the journal region up to the last record
-   - This ensures all TRANS_DATA records are durable before commit
+## Recovery (mount time, or the explicit `recover` command / UI button)
 
-4. **Write Commit Record**
-   - Write TRANS_COMMIT record with transaction ID
-   - This is the durability boundary - transaction is committed once this is durable
+1. Read block 0 and verify magic + CRC64. A bad superblock is a mount error (it is single-copy; see limitations).
+2. Scan the ring from `journal_tail`. Accept transaction *n* only if its txid is `checkpoint_txid + n`,
+   its BEGIN/DATA records have valid CRCs and targets (not the journal region, within the disk), and a
+   valid COMMIT record with the right record count follows. Stop at the first transaction that fails.
+   `journal_head` is not trusted.
+3. Replay accepted transactions in order (apply after-images). `flush`.
+4. Checkpoint: write the superblock with the new tail / checkpoint txid. `flush`.
+5. Anything else (no commit, torn commit, corrupt record, stale lap) is **discarded**, with a warning
+   in the result and an event.
 
-5. **Flush Commit Record**
-   - `fsync()` the commit record
-   - At this point, transaction is officially committed
+Running recovery again finds nothing to replay. Crashing *during* recovery is covered by two scenarios:
+the next recovery redoes the same work and reaches the same state.
 
-6. **Apply to Home Locations**
-   - Write each metadata after-image to its home block location
-   - These writes can be in any order (idempotent replay handles crashes)
+## Durability model (read this before trusting any claim)
 
-7. **Flush Home Locations**
-   - `fsync()` all modified home blocks
-   - Ensures metadata changes are durable at home locations
+The simulator models the disk as a **volatile write-back cache** (`cache_mode=volatile`, default):
 
-8. **Checkpoint**
-   - Advance journal tail to after this transaction
-   - Write CHECKPOINT record
-   - `fsync()` checkpoint
-   - Reclaim journal space
+* `write_block` goes to a cache; only `flush()` makes it durable.
+* On a crash, unflushed writes are lost. Writes inside one flush may reach the disk in any prefix
+  order (the "mid-flush" crash points), and one block can be torn to a prefix (`torn_bytes`).
+* A block write is otherwise atomic; there is no reordering *between* flushes.
 
-## Recovery Algorithm
+`writethrough` makes every write durable immediately; it is a weaker model that cannot exercise the
+ordering rules, so the crash matrix is run mainly in volatile mode.
 
-### Phase 1: Journal Scan
+**What is and is not claimed.** Within this model, the tests show that committed work survives, uncommitted
+work vanishes, recovery is idempotent and fsck is clean afterwards. This does **not** prove safety against
+real power loss: real disks and `fsync` implementations may reorder, lie, or tear writes in ways not modelled
+(e.g. torn writes of arbitrary sectors, bit rot, reordering without barriers). The image is an ordinary file;
+the host OS page cache sits underneath it.
 
-1. Read superblock, validate magic and version
-2. Read journal from checkpoint tail position (or journal start if no checkpoint)
-3. Scan sequentially through journal blocks:
-   - Read record header
-   - Validate checksum (header + payload)
-   - Validate record type and length
-   - Track transaction state per transaction ID
-   - Stop at first invalid/truncated record or journal head
+## Journal space
 
-### Phase 2: Transaction Classification
-
-For each transaction ID encountered:
-- **Committed**: Has valid TRANS_COMMIT record
-- **Incomplete**: Has TRANS_BEGIN but no valid TRANS_COMMIT
-- **Aborted**: Has TRANS_ABORT record
-
-Only committed transactions are replayed.
-
-### Phase 3: Replay
-
-For each committed transaction (in chronological order):
-1. Collect all TRANS_DATA records for this transaction
-2. For each TRANS_DATA record:
-   - Write after-image to target block at specified offset
-3. Flush all written blocks
-
-### Phase 4: Checkpoint Update
-
-1. Set journal tail to after the last committed transaction
-2. Write new CHECKPOINT record
-3. Flush checkpoint
-4. Update superblock journal tail
-
-### Phase 5: Consistency Verification
-
-Run consistency checker to validate recovered state.
-
-## Idempotency Guarantees
-
-- TRANS_DATA records contain complete after-images
-- Applying the same after-image multiple times produces identical result
-- Home block writes are idempotent
-- Checkpoint advancement is idempotent (monotonic)
-
-## Crash Scenarios and Outcomes
-
-| Crash Point | Recovery Outcome |
-|-------------|------------------|
-| During TRANS_BEGIN write | Transaction not seen, no effect |
-| During TRANS_DATA writes | Partial transaction, no commit record, discarded |
-| After journal flush, before commit | No commit record, transaction discarded |
-| During commit record write | Torn commit record (checksum fails), discarded |
-| After commit flush, before apply | Commit record valid, replay applies changes |
-| During home block writes | Partial apply, replay completes remaining |
-| After home flush, before checkpoint | Committed, replayed, checkpoint advances |
-| During checkpoint | Checkpoint may be incomplete, next recovery re-scans |
-
-## Journal Wraparound
-
-- Journal is a circular buffer
-- Head advances on writes, tail advances on checkpoint
-- Space between tail and head (circular) is used space
-- Transaction must fit in available space (head to tail - 1 block)
-- If insufficient space: force checkpoint or reject operation
-
-## Checkpoint Protocol
-
-Checkpoint record contains:
-- Checkpoint transaction ID (last fully applied transaction)
-- Journal head position at checkpoint time
-- Journal tail position (should equal after last committed transaction)
-
-On recovery, start scanning from checkpoint tail position.
-
-## Durability Assumptions
-
-1. **fsync() durability**: When `fsync()` returns, data is on stable storage
-2. **Write ordering**: `fsync()` creates a barrier; writes before `fsync()` are ordered before writes after
-3. **Block atomicity**: 4096-byte block writes are atomic (no torn blocks within a block)
-4. **Checksum detection**: CRC64 detects corruption with probability 1 - 2^-64
-
-## Limitations
-
-- No data journaling (only metadata)
-- File content writes are not transactional (metadata journaling only)
-- Single-threaded operation (no concurrent transactions)
-- Journal size fixed at format time
-- No online resizing
+* `eager` checkpoint (default): every transaction is checkpointed immediately, so the ring is reused from
+  the tail each time.
+* `lazy` checkpoint: committed transactions accumulate; when the ring fills, the engine checkpoints
+  automatically to reclaim space. If a single transaction still cannot fit, the operation fails with a
+  journal-full error and the filesystem stays consistent.
+* Wraparound: records may straddle the end of the ring; the scan wraps modulo the ring size and the
+  txid-sequence rule rejects stale blocks from earlier laps.

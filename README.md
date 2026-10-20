@@ -1,184 +1,72 @@
-# CRFS - Crash-Recoverable File System Simulator
+# CRFS — Crash-Recoverable File System Simulator
 
-A Python implementation of a crash-recoverable file system with write-ahead journaling for an Operating Systems course project.
+A small file system written in Python for an Operating Systems course. It lives in a disk-image file and
+uses **write-ahead (redo) journaling of metadata** so that a crash at any point leaves the image either
+with the whole operation or with none of it. It ships with a CLI, a deterministic crash-injection
+framework that really kills processes, a consistency checker (fsck) and a local web monitor.
 
-## Features
+> **What this is not.** It is a simulator on top of an ordinary file. The guarantees below are
+> proved against a *modelled* disk (see `docs/journaling-and-recovery.md`, "Durability model"); nothing
+> here claims safety against real power loss on real hardware.
 
-- **Virtual Disk**: Fixed-size block I/O on a disk image file with bounds checking and fault injection
-- **Write-Ahead Journaling**: Metadata transactions with redo logging, checksums, and commit records
-- **Crash Recovery**: Journal scanning, validation, and idempotent replay of committed transactions
-- **Consistency Checking**: Structural and allocation integrity verification
-- **Crash Injection**: Deterministic fault injection for testing crash recovery
-- **CLI Interface**: Interactive shell and single-command modes
-
-## Architecture
-
-```
-src/
-├── virtual_disk.py      # Disk image creation, block I/O, fault injection
-├── superblock.py        # Filesystem format metadata and validation
-├── block_allocator.py   # Free-space bitmap management
-├── inode.py             # Inode serialization and metadata
-├── directory.py         # Directory entry serialization
-├── journal.py           # Transaction records, checksums, commit records
-├── transaction.py       # Transaction lifecycle management
-├── recovery.py          # Journal scanning and replay
-├── consistency_checker.py # Structural integrity validation
-├── crash_injector.py    # Deterministic crash points
-├── filesystem.py        # Public filesystem operations
-└── cli.py               # Command-line interface
-```
-
-## Quick Start
+## Quick start
 
 ```bash
-# Format a new filesystem with options
-python -m src.cli filesystem.img --format --size 16M --journal-blocks 128 --inode-blocks 64 --label "MyVolume"
+# CLI (unchanged entry point)
+python -m src.cli demo.img --format --size 8M          # format
+python -m src.cli demo.img -c "mkdir /docs"            # single command
+python -m src.cli demo.img                             # interactive shell: help, ls, write, journal, check ...
 
-# Or use the CLI interactively
-python -m src.cli filesystem.img
-crfs> format 16M 128 64 "MyVolume"
-crfs> mkdir /home/user
-crfs> create /home/user/file.txt
-crfs> write /home/user/file.txt "Hello, World!"
-crfs> read /home/user/file.txt
-crfs> ls /home/user
-crfs> stat /home/user/file.txt
-crfs> exit
+# Web monitor (loopback only, no extra dependencies)
+python -m webui --image-dir crfs_images --open         # http://127.0.0.1:8765/
 ```
 
-## Format Options
+Developed and tested on Python 3.13 (older 3.x versions are untested); the engine and UI use only the standard library. `pytest` is only needed for the legacy
+test file; Playwright is only needed for the optional browser tests.
 
-| Option | Description | Default |
-|--------|-------------|---------|
-| `--size` | Disk size (K, M, G suffixes) | 16M |
-| `--journal-blocks` | Number of journal blocks | 128 |
-| `--inode-blocks` | Number of inode table blocks | 64 |
-| `--label` | Volume label | (empty) |
+## Layout
 
-## CLI Commands
+```
+src/            engine: virtual_disk, superblock, block_allocator, inode, directory, journal,
+                transaction, recovery, consistency_checker, filesystem, events
+                crash_injector, crash_worker, crash_lab (crash testing), cli
+webui/          local HTTP API (app.py) + static dark UI (static/)
+tests/          unit, engine-integrity, crash-recovery (subprocess SIGKILL), UI integration, browser E2E
+docs/           architecture, disk layout, journaling & recovery, testing, UI guide, demo script, limitations
+```
 
-### Filesystem Operations
-- `format [size] [journal_blocks] [inode_blocks] [label]` - Format new filesystem
-- `mount` - Mount existing filesystem
-- `unmount` - Unmount filesystem
-- `mkdir <path>` - Create directory
-- `create <path>` - Create empty file
-- `write <path> <text>` - Write text to file
-- `read <path>` - Read file contents
-- `append <path> <text>` - Append text to file
-- `ls [path]` - List directory (default: /)
-- `stat <path>` - Show file/directory info
-- `rename <old> <new>` - Rename/move file or directory
-- `delete <path>` - Delete file
-- `rmdir <path>` - Remove empty directory
+## How a metadata change is made durable
 
-### Utility Commands
-- `df` - Show disk usage
-- `dump` - Dump filesystem state (JSON)
-- `check` - Run consistency check
-- `recover` - Run crash recovery
+1. **PREPARE** – the operation runs against a staging overlay; no metadata block is touched.
+2. **JOURNAL WRITE + FLUSH** – after-images (changed byte ranges) go to the circular log, then `flush`.
+3. **COMMIT** – a commit record (with a record count and CRC) is written to its own block, then `flush`.
+   This flush is the commit point.
+4. **APPLY** – metadata blocks are written to their home locations, then `flush`.
+5. **CHECKPOINT** – the superblock advances the journal tail / checkpoint txid, then `flush`.
 
-### Crash Testing
-- `enable-crash-injection <mode>` - Enable crash injection (exception|subprocess|none)
-- `crash-test <scenario>` - Run crash test scenario
-- `disable-crash-injection` - Disable crash injection
-
-Available crash scenarios:
-- `crash_before_journal_write`
-- `crash_during_journal_write`
-- `crash_after_journal_write_before_flush`
-- `crash_after_journal_flush_before_commit`
-- `crash_during_commit_write`
-- `crash_after_commit_write_before_flush`
-- `crash_after_commit_flush_before_apply`
-- `crash_during_home_apply`
-- `crash_after_home_apply_before_flush`
-- `crash_after_home_flush_before_checkpoint`
-- `crash_during_checkpoint`
-- `crash_during_recovery_scan`
-- `crash_during_recovery_replay`
-
-## Requirements
-
-- Python 3.11+
-- No external dependencies (uses only standard library)
+File *data* blocks are copy-on-write and flushed before the commit ("ordered mode"), so a committed
+inode never points at unwritten data. On mount, recovery replays committed-but-not-checkpointed
+transactions in order and discards anything else. Replay is idempotent.
 
 ## Testing
 
 ```bash
-# Run all tests
-python -m pytest tests/ -v
-
-# Run specific test class
-python -m pytest tests/test_filesystem.py::TestFileSystem -v
-
-# Run crash injection tests only
-python -m pytest tests/ -v -k "crash"
-
-# Run recovery tests
-python -m pytest tests/ -v -k "recovery"
-
-# Run consistency checker tests
-python -m pytest tests/ -v -k "consistency"
-
-# Generate coverage report
-python -m pytest tests/ --cov=src --cov-report=html
+python -m unittest tests.test_engine_integrity tests.test_crash_recovery tests.test_webui tests.test_webui_e2e -v
+python -m pytest tests/test_filesystem.py            # legacy suite (needs pytest)
 ```
+
+See `docs/testing.md` for what each suite proves and the exact results recorded for this revision.
 
 ## Documentation
 
-- [Architecture](docs/architecture.md) - Component architecture and module responsibilities
-- [Architecture Diagram](docs/architecture-diagram.md) - Mermaid diagram of component relationships
-- [Disk Layout](docs/disk-layout.md) - Exact block regions, offsets, structures, and format constraints
-- [Journaling and Recovery](docs/journaling-and-recovery.md) - Transaction protocol, commit protocol, write ordering, replay rules
-- [Testing](docs/testing.md) - Test organization, crash points, invariants
-- [Demo Script](docs/demo-script.md) - 5-8 minute presentation demonstration
-- [Limitations](docs/limitations.md) - Unsupported functionality, durability assumptions, known issues
-- [Development Plan](docs/development-plan.md) - Implemented phases and remaining work
-- [Crash Test Report](docs/crash-test-report.md) - Test results from crash injection suite
-
-## Test Results
-
-- **41/41 tests passing** (100%)
-- All crash scenarios verified (13/13)
-- Recovery tests pass
-- Consistency checker validates structural integrity
-
-## Example: Crash Recovery Demo
-
-```bash
-# 1. Setup
-python -m src.cli demo.img --format --size 16M
-python -m src.cli demo.img
-crfs> mkdir /projects/demo
-crfs> create /projects/demo/README.txt
-crfs> write /projects/demo/README.txt "OLD DATA"
-
-# 2. Inject crash BEFORE commit (old data should be preserved)
-crfs> enable-crash-injection exception
-crfs> crash-test crash_after_journal_flush_before_commit
-crfs> write /projects/demo/README.txt "NEW DATA"
-crfs> exit
-
-# 3. Recover and verify
-python -m src.cli demo.img
-crfs> read /projects/demo/README.txt
-# Output: OLD DATA (old data preserved)
-
-# 4. Inject crash AFTER commit (new data should be recovered)
-python -m src.cli demo.img
-crfs> enable-crash-injection exception
-crfs> crash-test crash_after_commit_flush_before_apply
-crfs> write /projects/demo/README.txt "NEW DATA v2"
-crfs> exit
-
-# 5. Recover committed transaction
-python -m src.cli demo.img
-crfs> read /projects/demo/README.txt
-# Output: NEW DATA v2 (committed transaction replayed)
-```
-
-## License
-
-Educational project for Operating Systems course.
+| Doc | Content |
+|---|---|
+| `docs/architecture.md` | modules, layering, data flow, UI/backend boundary |
+| `docs/disk-layout.md` | exact on-disk format |
+| `docs/journaling-and-recovery.md` | protocol, recovery algorithm, durability model |
+| `docs/testing.md` | test strategy, crash matrix, commands |
+| `docs/crash-test-report.md` | the 14-scenario × 6-operation matrix |
+| `docs/ui-guide.md` | the seven monitor screens |
+| `docs/demo-script.md` | 5–7 minute viva demo |
+| `docs/audit.md` | Phase 1 bug audit |
+| `docs/limitations.md` | known limitations and unverified claims |

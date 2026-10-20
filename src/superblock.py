@@ -120,6 +120,11 @@ class Superblock:
         )
         return crc64(data)
     
+    def copy(self) -> 'Superblock':
+        """Shallow copy (all fields are immutable scalars/bytes)."""
+        import dataclasses
+        return dataclasses.replace(self)
+
     def verify_checksum(self) -> bool:
         """Verify superblock checksum."""
         return self._checksum == self.compute_checksum()
@@ -271,17 +276,28 @@ class Superblock:
             raise ValueError("Superblock checksum mismatch")
 
 
-def crc64(data: bytes) -> int:
-    """Compute CRC64-ECMA-182 checksum."""
-    crc = 0
-    for byte in data:
-        crc ^= byte << 56
+def _build_crc64_table():
+    table = []
+    for i in range(256):
+        crc = i << 56
         for _ in range(8):
             if crc & (1 << 63):
-                crc = (crc << 1) ^ CRC64_POLY
+                crc = ((crc << 1) ^ CRC64_POLY) & 0xFFFFFFFFFFFFFFFF
             else:
-                crc = (crc << 1)
-            crc &= (1 << 64) - 1
+                crc = (crc << 1) & 0xFFFFFFFFFFFFFFFF
+        table.append(crc)
+    return table
+
+
+_CRC64_TABLE = _build_crc64_table()
+
+
+def crc64(data: bytes) -> int:
+    """CRC-64/ECMA-182 (MSB-first, init 0, no xor-out), table driven."""
+    crc = 0
+    table = _CRC64_TABLE
+    for byte in data:
+        crc = table[((crc >> 56) ^ byte) & 0xFF] ^ ((crc << 8) & 0xFFFFFFFFFFFFFFFF)
     return crc
 
 

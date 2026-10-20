@@ -15,7 +15,9 @@ from .filesystem import (
     FileSystemError, PathError, NotFoundError, AlreadyExistsError,
     NotDirectoryError, IsDirectoryError, DirectoryNotEmptyError, DiskFullError
 )
+from .virtual_disk import CrashInjectedError
 from .crash_injector import CrashInjector, CrashMode, CrashPoint, get_global_injector
+from .crash_worker import OPERATIONS as LAB_OPERATIONS
 
 
 class CLI:
@@ -76,6 +78,19 @@ class CLI:
                 self.cmd_enable_crash_injection(cmd_args)
             elif cmd in ('disable-crash-injection', 'disable-crash'):
                 self.cmd_disable_crash_injection(cmd_args)
+            elif cmd in ('journal', 'jdump'):
+                self.cmd_journal(cmd_args)
+            elif cmd == 'inode':
+                self.cmd_inode(cmd_args)
+            elif cmd == 'block':
+                self.cmd_block(cmd_args)
+            elif cmd == 'layout':
+                self.cmd_layout(cmd_args)
+            elif cmd == 'events':
+                self.cmd_events(cmd_args)
+            elif cmd == 'checkpoint':
+                self.fs.checkpoint()
+                print("Checkpoint done")
             elif cmd in ('exit', 'quit', 'q'):
                 self.running = False
                 return 1  # Signal to exit
@@ -86,8 +101,11 @@ class CLI:
         except FileSystemError as e:
             print(f"Error: {e}")
             return 1
+        except CrashInjectedError as e:
+            print(f"CRASH: {e}  (the simulated process is dead; exit and remount to recover)")
+            return 2
         except Exception as e:
-            print(f"Unexpected error: {e}")
+            print(f"Unexpected error ({type(e).__name__}): {e}")
             return 1
         
         return 0
@@ -138,7 +156,11 @@ class CLI:
               dump                                                   - Dump filesystem state
               check                                                  - Run consistency check
               recover                                                - Run crash recovery
-              crash-test <scenario>                                  - Run crash test scenario
+              journal                                                - Show transactions found in the journal region
+              inode <n> / block <n> / layout                         - Inspect disk structures
+              events [n]                                             - Show the last n engine events
+              checkpoint                                             - Force a journal checkpoint
+              crash-test [scenario] [operation]                      - Run a REAL crash scenario (SIGKILL) on a temp image
               enable-crash-injection <mode>                          - Enable crash injection
               disable-crash-injection                                - Disable crash injection
               help                                                   - Show this help
@@ -203,8 +225,14 @@ class CLI:
         
         self.fs.mount(run_recovery=run_recovery)
         print(f"Mounted {self.fs.disk_path}")
-        if run_recovery:
-            print("Recovery completed")
+        rec = self.fs.last_recovery
+        if run_recovery and rec is not None:
+            print(f"Recovery: {rec.transactions_replayed} transaction(s) replayed, "
+                  f"{rec.transactions_discarded} discarded")
+            for w in rec.warnings:
+                print(f"  warning: {w}")
+        elif not run_recovery:
+            print("Mounted READ-ONLY, recovery not run (use 'recover' to replay the journal)")
     
     def cmd_unmount(self, args: List[str]) -> None:
         """Unmount filesystem."""
@@ -347,57 +375,85 @@ class CLI:
     
     def cmd_check(self, args: List[str]) -> None:
         """Run consistency check."""
-        errors = self.fs.check()
-        if errors:
-            print(f"Consistency check FAILED ({len(errors)} errors):")
-            for err in errors:
-                print(f"  - {err}")
-        else:
+        rep = self.fs.check_report()
+        if rep.passed:
             print("Consistency check PASSED")
-    
+        else:
+            print(f"Consistency check FAILED ({len(rep.errors)} errors)")
+        for f in rep.findings:
+            print(f"  [{f['severity'].upper():7}] {f['code']}: {f['message']}")
+            print(f"            why it matters: {f['why']}")
+
     def cmd_recover(self, args: List[str]) -> None:
         """Run recovery."""
         print("Running recovery...")
-        self.fs.recover()
-        print("Recovery completed")
-    
+        res = self.fs.recover()
+        print(res)
+        for r in res.replayed:
+            print(f"  replayed tx {r['txid']} -> blocks {r['blocks']}")
+        for d in res.discarded:
+            print(f"  discarded tx {d['txid']}: {d['reason']}")
+        for w in res.warnings:
+            print(f"  warning: {w}")
+
+    def cmd_journal(self, args: List[str]) -> None:
+        v = self.fs.journal_view()
+        st = v['stats']
+        print(f"journal: {st['journal_blocks']} blocks, head={st['head']} tail={st['tail']} "
+              f"checkpoint_txid={st['checkpoint_txid']} next_txid={st['next_txid']}")
+        for t in v['transactions'][-20:]:
+            kinds = ','.join(r['type'].replace('TRANS_', '') for r in t['records'])
+            print(f"  tx {t['txid']:>4} blocks {t['start_block']}+{t['blocks']}  {t['state']:<24} [{kinds}]")
+
+    def cmd_inode(self, args: List[str]) -> None:
+        import json
+        print(json.dumps(self.fs.inode_info(int(args[0])), indent=2))
+
+    def cmd_block(self, args: List[str]) -> None:
+        import json
+        info = self.fs.block_info(int(args[0]))
+        print(json.dumps(info, indent=2, default=str))
+
+    def cmd_layout(self, args: List[str]) -> None:
+        for r in self.fs.layout():
+            print(f"{r['name']:<12} blocks {r['start_block']:>6}-{r['end_block']:<6} "
+                  f"offset {r['offset_bytes']:>10}  size {r['size_bytes']:>10}  used {r['used_blocks']}")
+
+    def cmd_events(self, args: List[str]) -> None:
+        import time as _t
+        n = int(args[0]) if args else 30
+        for e in self.fs.events.snapshot()[-n:]:
+            tx = f"tx{e['txid']}" if e['txid'] else '   '
+            print(f"{_t.strftime('%H:%M:%S', _t.localtime(e['ts']))} {e['severity']:<7} {e['kind']:<16} {tx:<6} {e['message']}")
+
     def cmd_crash_test(self, args: List[str]) -> None:
-        """Run crash test scenario."""
+        """Run a REAL crash scenario (separate processes, SIGKILL) on a temporary image."""
+        from .crash_lab import run_scenario
+        injector = CrashInjector()
         if not args:
-            print("Usage: crash-test <scenario_name>")
-            print("Available scenarios:")
-            injector = CrashInjector()
+            print("Usage: crash-test <scenario> [operation]")
+            print("Scenarios:")
             for s in injector.get_scenarios():
                 print(f"  {s.name}: {s.description}")
+            print("Operations: " + ", ".join(LAB_OPERATIONS))
             return
-        
-        scenario_name = args[0]
-        injector = CrashInjector()
-        scenario = injector.get_scenario(scenario_name)
-        
+        operation = args[1] if len(args) > 1 else "create_file"
+        scenario = injector.get_scenario(args[0])
         if not scenario:
-            print(f"Unknown scenario: {scenario_name}")
+            print(f"Unknown scenario: {args[0]}")
             return
-        
-        print(f"Running crash test: {scenario.name}")
-        print(f"Description: {scenario.description}")
-        print(f"Crash point: {scenario.crash_point.name}")
-        print(f"Expected: {scenario.expected_outcome}")
-        
-        # Enable crash injection
-        self.fs.enable_crash_injection(CrashMode.EXCEPTION)
-        injector = get_global_injector()
-        injector.enable(scenario.crash_point)
-        
-        try:
-            # This would run the operation that should crash
-            # For demo, we'll just show the mechanism
-            print("Crash injection enabled. Run an operation to trigger crash.")
-        except Exception as e:
-            print(f"Crash injected: {e}")
-        finally:
-            self.fs.disable_crash_injection()
-    
+        print(f"Scenario : {scenario.name} - {scenario.description}")
+        print(f"Operation: {LAB_OPERATIONS[operation]['label']}")
+        print("(runs on a temporary image; your disk image is not touched)")
+        r = run_scenario(scenario.name, operation)
+        for st in r["steps"]:
+            print(f"  step: {st['step']}  (killed={st.get('killed')}, rc={st.get('returncode')})")
+        print(f"Expected after recovery: {r['expected_state'].upper()}")
+        print(f"Actual   after recovery: {'operation SURVIVED' if r.get('survived') else 'operation ABSENT'}")
+        for name, ok in (r.get('checks') or {}).items():
+            print(f"  [{'ok' if ok else 'FAIL'}] {name}")
+        print(f"VERDICT: {r['verdict']}")
+
     def cmd_enable_crash_injection(self, args: List[str]) -> None:
         """Enable crash injection."""
         if not args:
@@ -437,12 +493,17 @@ def main():
     parser.add_argument('--journal-blocks', type=int, default=128, help='Journal blocks for format (default: 128)')
     parser.add_argument('--inode-blocks', type=int, default=64, help='Inode blocks for format (default: 64)')
     parser.add_argument('--label', default='', help='Volume label for format (default: empty)')
-    parser.add_argument('--no-recovery', action='store_true', help='Skip recovery on mount')
+    parser.add_argument('--no-recovery', action='store_true', help='Mount read-only without running recovery')
+    parser.add_argument('--cache-mode', choices=['volatile', 'writethrough'], default='volatile',
+                        help='Disk durability model (default: volatile write-back cache)')
+    parser.add_argument('--checkpoint', choices=['eager', 'lazy'], default='eager',
+                        help='Checkpoint after every transaction, or lazily when the journal fills')
     
     args = parser.parse_args()
     
-    fs = FileSystem(args.disk)
+    fs = FileSystem(args.disk, cache_mode=args.cache_mode, checkpoint=args.checkpoint)
     cli = CLI(fs)
+    exit_code = 0
     
     try:
         if args.format or args.command == 'format':
@@ -466,9 +527,9 @@ def main():
             # Run single command
             fs.mount(run_recovery=not args.no_recovery)
             cmd_args = shlex.split(args.command)
-            cli.run_command(cmd_args)
+            exit_code = cli.run_command(cmd_args)
             fs.unmount()
-            return
+            sys.exit(exit_code)
         else:
             # Interactive mode - auto-mount if exists
             import os

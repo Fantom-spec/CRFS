@@ -8,7 +8,6 @@ import struct
 import time
 from dataclasses import dataclass
 from typing import List, Optional, Iterator, Tuple
-from .virtual_disk import VirtualDisk
 from .inode import Inode, InodeType, InodeTable, DIRECT_POINTERS
 from .block_allocator import BlockAllocator
 
@@ -55,6 +54,20 @@ class InvalidNameError(DirectoryError):
     pass
 
 
+class CorruptDirectoryError(DirectoryError):
+    """Raised when a directory block cannot be decoded."""
+    pass
+
+
+def validate_name(name: str) -> None:
+    if not name or name in (".", ".."):
+        raise InvalidNameError(f"Invalid or reserved name: {name!r}")
+    if "/" in name or "\x00" in name:
+        raise InvalidNameError(f"Name may not contain '/' or NUL: {name!r}")
+    if len(name.encode("utf-8")) > MAX_NAME_LEN:
+        raise InvalidNameError(f"Name too long (max {MAX_NAME_LEN} bytes): {name!r}")
+
+
 @dataclass
 class DirEntry:
     """Directory entry representation."""
@@ -63,8 +76,8 @@ class DirEntry:
     file_type: int  # DIR_TYPE_FILE or DIR_TYPE_DIR
     
     def __post_init__(self):
-        if len(self.name) > MAX_NAME_LEN:
-            raise InvalidNameError(f"Name too long: {len(self.name)} > {MAX_NAME_LEN}")
+        if len(self.name.encode("utf-8")) > MAX_NAME_LEN:
+            raise InvalidNameError(f"Name too long: {len(self.name.encode('utf-8'))} > {MAX_NAME_LEN} bytes")
         # Allow inode_num=0 for empty entries
         if self.inode_num < 0:
             raise ValueError(f"Invalid inode number: {self.inode_num}")
@@ -100,6 +113,8 @@ class DirEntry:
             return cls(0, "", 0)  # Empty entry
         
         # Extract name (null-terminated)
+        if name_len > MAX_NAME_LEN:
+            raise InvalidNameError(f"corrupt directory entry: name length {name_len}")
         name_bytes = data[12:12 + name_len]
         name = name_bytes.decode('utf-8', errors='replace')
         
@@ -111,303 +126,200 @@ class DirEntry:
 
 
 class Directory:
-    """Manages a single directory's entries."""
-    
-    def __init__(self, inode: Inode, inode_table: InodeTable, 
-                 block_allocator: BlockAllocator, disk: VirtualDisk):
+    """
+    A single directory.  Entries are read from / written to the directory's
+    data blocks through ``self.disk`` (the transaction-staging proxy in a
+    mounted filesystem); there is no entry cache.
+    """
+
+    def __init__(self, inode: Inode, inode_table: InodeTable,
+                 block_allocator: BlockAllocator, disk, tx_manager=None):
         self.inode = inode
         self.inode_table = inode_table
         self.block_allocator = block_allocator
         self.disk = disk
-        self._entries_cache: Optional[List[DirEntry]] = None
-        self._cache_dirty = False
-    
-    def _load_entries(self) -> List[DirEntry]:
-        """Load all directory entries from disk."""
+        self.tx_manager = tx_manager  # unused (kept for compatibility)
+        self._parent_inode_num: int = 0
+
+    # ---------------------------------------------------------------- reads
+    def _read_raw_entries(self) -> List[DirEntry]:
+        """All non-empty entries including '.' and '..'."""
         entries = []
-        
         for block_ptr in self.inode.direct:
             if block_ptr == 0:
-                break
-            
-            block_data = self.disk.read_block(block_ptr)
-            
+                continue
+            block = self.disk.read_block(block_ptr)
             for i in range(ENTRIES_PER_BLOCK):
-                offset = i * DIR_ENTRY_SIZE
-                entry_data = block_data[offset:offset + DIR_ENTRY_SIZE]
-                entry = DirEntry.from_bytes(entry_data)
-                
-                if entry.is_empty:
-                    continue
-                
-                # Skip . and .. entries
-                if entry.name in (".", ".."):
-                    continue
-                
-                entries.append(entry)
-        
+                chunk = block[i * DIR_ENTRY_SIZE:(i + 1) * DIR_ENTRY_SIZE]
+                try:
+                    entry = DirEntry.from_bytes(chunk)
+                except (DirectoryError, ValueError) as e:
+                    raise CorruptDirectoryError(
+                        f"directory inode {self.inode.inode_num}, block {block_ptr}, slot {i}: {e}") from e
+                if not entry.is_empty:
+                    entries.append(entry)
         return entries
-    
+
+    def _load_entries(self) -> List[DirEntry]:
+        return [e for e in self._read_raw_entries() if e.name not in (".", "..")]
+
     def _get_entries(self) -> List[DirEntry]:
-        """Get entries, using cache if valid."""
-        if self._entries_cache is None or self._cache_dirty:
-            self._entries_cache = self._load_entries()
-            self._cache_dirty = False
-        return self._entries_cache
-    
+        return self._load_entries()
+
     def _invalidate_cache(self) -> None:
-        """Invalidate the entries cache."""
-        self._entries_cache = None
-        self._cache_dirty = True
-    
-    def _write_entries(self, entries: List[DirEntry]) -> None:
-        """Write entries to directory blocks."""
-        # Calculate required blocks
-        total_entries = len(entries) + 2  # +2 for . and ..
-        required_blocks = (total_entries + ENTRIES_PER_BLOCK - 1) // ENTRIES_PER_BLOCK
-        
-        # Ensure we have enough blocks
-        current_blocks = sum(1 for b in self.inode.direct if b != 0)
-        
-        if required_blocks > current_blocks:
-            # Allocate new blocks
-            for _ in range(required_blocks - current_blocks):
-                new_blocks = self.block_allocator.allocate(1)
-                if not new_blocks:
-                    raise DirectoryFullError("No free blocks for directory expansion")
-                
-                # Find first empty direct pointer
-                for i in range(DIRECT_POINTERS):
-                    if self.inode.direct[i] == 0:
-                        self.inode.direct[i] = new_blocks[0]
-                        self.inode.blocks_allocated += 1
-                        self.inode._dirty = True
+        pass
+
+    def _read_parent_inode(self) -> int:
+        if self._parent_inode_num:
+            return self._parent_inode_num
+        if self.inode.inode_num == 1:
+            return 1
+        for e in self._read_raw_entries():
+            if e.name == "..":
+                self._parent_inode_num = e.inode_num
+                return e.inode_num
+        return self.inode.inode_num
+
+    # --------------------------------------------------------------- writes
+    def _write_entries(self, entries: List[DirEntry], parent_inode_num: Optional[int] = None) -> None:
+        """Rewrite the whole directory (including '.' and '..') and its inode."""
+        total = len(entries) + 2
+        required = (total + ENTRIES_PER_BLOCK - 1) // ENTRIES_PER_BLOCK
+        current = sum(1 for b in self.inode.direct if b != 0)
+        if required > DIRECT_POINTERS:
+            raise DirectoryFullError(
+                f"directory would need {required} blocks (max {DIRECT_POINTERS})")
+        parent = parent_inode_num if parent_inode_num else self._read_parent_inode()
+        if required > current:
+            try:
+                new_blocks = self.block_allocator.allocate_any(required - current)
+            except Exception as e:
+                raise DirectoryFullError(f"no free blocks for directory expansion: {e}") from e
+            it = iter(new_blocks)
+            for i in range(DIRECT_POINTERS):
+                if self.inode.direct[i] == 0:
+                    try:
+                        blk = next(it)
+                    except StopIteration:
                         break
-        
-        # Write entries to blocks
-        all_entries = [
-            DirEntry(self.inode.inode_num, ".", DIR_TYPE_DIR),
-            DirEntry(self.inode_table.read_inode(self.inode.direct[0]).inode_num if self.inode.direct[0] else self.inode.inode_num, "..", DIR_TYPE_DIR)
-        ] + entries
-        
-        entry_idx = 0
-        for block_idx in range(DIRECT_POINTERS):
-            block_ptr = self.inode.direct[block_idx]
-            if block_ptr == 0:
-                if entry_idx < len(all_entries):
-                    # Need to allocate (should have been done above)
-                    new_blocks = self.block_allocator.allocate(1)
-                    if not new_blocks:
-                        raise DirectoryFullError("No free blocks")
-                    block_ptr = new_blocks[0]
-                    self.inode.direct[block_idx] = block_ptr
+                    self.inode.direct[i] = self.block_allocator._get_absolute_block(blk)
                     self.inode.blocks_allocated += 1
-                    self.inode._dirty = True
-                else:
-                    break
-            
-            block_data = bytearray(4096)
-            for i in range(ENTRIES_PER_BLOCK):
-                if entry_idx < len(all_entries):
-                    entry_bytes = all_entries[entry_idx].to_bytes()
-                    block_data[i * DIR_ENTRY_SIZE:(i + 1) * DIR_ENTRY_SIZE] = entry_bytes
-                    entry_idx += 1
-                else:
-                    # Empty entry
-                    block_data[i * DIR_ENTRY_SIZE:(i + 1) * DIR_ENTRY_SIZE] = b'\x00' * DIR_ENTRY_SIZE
-            
-            self.disk.write_block(block_ptr, bytes(block_data))
-        
-        # Update inode size
+
+        all_entries = [DirEntry(self.inode.inode_num, ".", DIR_TYPE_DIR),
+                       DirEntry(parent, "..", DIR_TYPE_DIR)] + list(entries)
+        idx = 0
+        for ptr in self.inode.direct:
+            if ptr == 0:
+                continue
+            block = bytearray(4096)
+            for slot in range(ENTRIES_PER_BLOCK):
+                if idx < len(all_entries):
+                    block[slot * DIR_ENTRY_SIZE:(slot + 1) * DIR_ENTRY_SIZE] = all_entries[idx].to_bytes()
+                    idx += 1
+            self.disk.write_block(ptr, bytes(block))
         self.inode.size = len(entries) * DIR_ENTRY_SIZE
         self.inode.update_timestamps(mtime=True, ctime=True)
         self.inode_table.write_inode(self.inode)
-        
-        self._entries_cache = entries
-        self._cache_dirty = False
-    
+        self._parent_inode_num = parent
+
+    # ------------------------------------------------------------ operations
     def lookup(self, name: str) -> Optional[int]:
-        """Look up a name, return inode number or None."""
         if name == ".":
             return self.inode.inode_num
         if name == "..":
-            # Return parent inode (first block's inode or self for root)
-            if self.inode.direct[0] != 0:
-                # We'd need to read the parent directory to get its inode
-                # For now, return self for root
-                pass
-            return self.inode.inode_num  # Simplified
-        
-        entries = self._get_entries()
-        for entry in entries:
+            return self._read_parent_inode()
+        for entry in self._load_entries():
             if entry.name == name:
                 return entry.inode_num
         return None
-    
+
     def add_entry(self, name: str, inode_num: int, file_type: int) -> None:
-        """Add a new entry."""
-        if len(name) > MAX_NAME_LEN:
-            raise InvalidNameError(f"Name too long: {name}")
-        if name in (".", ".."):
-            raise InvalidNameError(f"Reserved name: {name}")
-        
-        entries = self._get_entries()
-        
-        # Check for duplicate
-        for entry in entries:
-            if entry.name == name:
-                raise EntryExistsError(f"Entry '{name}' already exists")
-        
-        # Add new entry
-        new_entry = DirEntry(inode_num, name, file_type)
-        entries.append(new_entry)
+        validate_name(name)
+        entries = self._load_entries()
+        if any(e.name == name for e in entries):
+            raise EntryExistsError(f"Entry '{name}' already exists")
+        entries.append(DirEntry(inode_num, name, file_type))
         self._write_entries(entries)
-    
+
     def remove_entry(self, name: str) -> int:
-        """Remove an entry, return its inode number."""
         if name in (".", ".."):
             raise InvalidNameError(f"Cannot remove reserved name: {name}")
-        
-        entries = self._get_entries()
-        
+        entries = self._load_entries()
         for i, entry in enumerate(entries):
             if entry.name == name:
-                inode_num = entry.inode_num
                 del entries[i]
                 self._write_entries(entries)
-                return inode_num
-        
+                return entry.inode_num
         raise EntryNotFoundError(f"Entry '{name}' not found")
-    
+
     def rename_entry(self, old_name: str, new_name: str) -> None:
-        """Rename an entry."""
         if old_name in (".", "..") or new_name in (".", ".."):
             raise InvalidNameError("Cannot rename reserved names")
-        if len(new_name) > MAX_NAME_LEN:
-            raise InvalidNameError(f"New name too long: {new_name}")
-        
-        entries = self._get_entries()
-        
-        # Check new name doesn't exist
-        for entry in entries:
-            if entry.name == new_name:
-                raise EntryExistsError(f"Entry '{new_name}' already exists")
-        
-        # Find and rename
+        validate_name(new_name)
+        entries = self._load_entries()
+        if any(e.name == new_name for e in entries):
+            raise EntryExistsError(f"Entry '{new_name}' already exists")
         for entry in entries:
             if entry.name == old_name:
                 entry.name = new_name
                 self._write_entries(entries)
                 return
-        
         raise EntryNotFoundError(f"Entry '{old_name}' not found")
-    
+
+    def set_parent(self, new_parent_inode: int) -> None:
+        """Re-point '..' (used when a directory is moved)."""
+        self._write_entries(self._load_entries(), parent_inode_num=new_parent_inode)
+
     def list_entries(self) -> List[DirEntry]:
-        """List all entries (excluding . and ..)."""
-        return self._get_entries()
-    
+        return self._load_entries()
+
     def get_entry(self, name: str) -> Optional[DirEntry]:
-        """Get a specific entry by name."""
         if name == ".":
             return DirEntry(self.inode.inode_num, ".", DIR_TYPE_DIR)
         if name == "..":
-            return DirEntry(self.inode.inode_num, "..", DIR_TYPE_DIR)
-        
-        entries = self._get_entries()
-        for entry in entries:
+            return DirEntry(self._read_parent_inode(), "..", DIR_TYPE_DIR)
+        for entry in self._load_entries():
             if entry.name == name:
                 return entry
         return None
-    
+
     def entry_count(self) -> int:
-        """Get number of entries (excluding . and ..)."""
-        return len(self._get_entries())
-    
+        return len(self._load_entries())
+
     def is_empty(self) -> bool:
-        """Check if directory is empty (only . and ..)."""
-        return len(self._get_entries()) == 0
-    
-    def ensure_block_allocated(self) -> int:
-        """Ensure directory has at least one data block, return it."""
-        for block_ptr in self.inode.direct:
-            if block_ptr != 0:
-                return block_ptr
-        
-        # Allocate first block
-        new_blocks = self.block_allocator.allocate(1)
-        if not new_blocks:
-            raise DirectoryFullError("No free blocks for directory")
-        
-        # Convert to absolute block number
-        abs_block = self.block_allocator._get_absolute_block(new_blocks[0])
-        self.inode.direct[0] = abs_block
-        self.inode.blocks_allocated += 1
-        self.inode._dirty = True
-        self.inode_table.write_inode(self.inode)
-        
-        # Initialize block with . and .. entries
-        block_data = bytearray(4096)
-        dot_entry = DirEntry(self.inode.inode_num, ".", DIR_TYPE_DIR).to_bytes()
-        dotdot_entry = DirEntry(self.inode.inode_num, "..", DIR_TYPE_DIR).to_bytes()
-        block_data[0:DIR_ENTRY_SIZE] = dot_entry
-        block_data[DIR_ENTRY_SIZE:2*DIR_ENTRY_SIZE] = dotdot_entry
-        self.disk.write_block(abs_block, bytes(block_data))
-        
-        return abs_block
+        return self.entry_count() == 0
 
 
-def initialize_root_directory(inode_table: InodeTable, block_allocator: BlockAllocator, disk: VirtualDisk) -> Directory:
-    """Initialize the root directory with . and .. entries."""
-    root_inode = inode_table.read_inode(1)
-    
-    # Initialize root inode if it's free
-    if root_inode.is_free:
+def new_directory_block(self_inode: int, parent_inode: int) -> bytes:
+    """A fresh directory data block containing only '.' and '..'."""
+    block = bytearray(4096)
+    block[0:DIR_ENTRY_SIZE] = DirEntry(self_inode, ".", DIR_TYPE_DIR).to_bytes()
+    block[DIR_ENTRY_SIZE:2 * DIR_ENTRY_SIZE] = DirEntry(parent_inode, "..", DIR_TYPE_DIR).to_bytes()
+    return bytes(block)
+
+
+def initialize_root_directory(inode_table: InodeTable, block_allocator: BlockAllocator,
+                              disk, tx_manager=None) -> Directory:
+    """
+    Create the root directory (inode 1 + one data block).  Must be called
+    inside a transaction.
+    """
+    sb = inode_table.superblock
+    root = inode_table.read_inode(1)
+    if root.is_free:
         now = time.time_ns()
-        root_inode.type = InodeType.DIRECTORY
-        root_inode.mode = 0o755
-        root_inode.uid = 0
-        root_inode.gid = 0
-        root_inode.size = 0
-        root_inode.blocks_allocated = 0
-        root_inode.ctime = now
-        root_inode.mtime = now
-        root_inode.atime = now
-        root_inode.chtime = now
-        root_inode.direct = [0] * DIRECT_POINTERS
-        root_inode.indirect1 = 0
-        root_inode.indirect2 = 0
-        root_inode.indirect3 = 0
-        root_inode.link_count = 2
-        root_inode.flags = 0
-        root_inode.generation = 1
-        root_inode._dirty = True
-        
-        inode_table.write_inode(root_inode)
-        
-        # Update superblock
-        inode_table.superblock.free_inode_count -= 1
-        inode_table.superblock.next_free_inode = 2
-        inode_table.superblock._dirty = True
-    
-    # Ensure root has a block
-    if root_inode.direct[0] == 0:
-        new_blocks = block_allocator.allocate(1)
-        if not new_blocks:
-            raise DirectoryFullError("No free blocks for root directory")
-        
-        # Convert to absolute block number
-        abs_block = block_allocator._get_absolute_block(new_blocks[0])
-        root_inode.direct[0] = abs_block
-        root_inode.blocks_allocated = 1
-        root_inode._dirty = True
-        inode_table.write_inode(root_inode)
-        
-        # Write . and .. entries
-        block_data = bytearray(4096)
-        dot_entry = DirEntry(1, ".", DIR_TYPE_DIR).to_bytes()
-        dotdot_entry = DirEntry(1, "..", DIR_TYPE_DIR).to_bytes()
-        block_data[0:DIR_ENTRY_SIZE] = dot_entry
-        block_data[DIR_ENTRY_SIZE:2*DIR_ENTRY_SIZE] = dotdot_entry
-        disk.write_block(abs_block, bytes(block_data))
-    
-    return Directory(root_inode, inode_table, block_allocator, disk)
+        root = Inode(inode_num=1, type=InodeType.DIRECTORY, mode=0o755, ctime=now, mtime=now,
+                     atime=now, chtime=now, link_count=2, generation=1)
+        sb.free_inode_count -= 1
+        sb.next_free_inode = 2
+        sb._dirty = True
+    if root.direct[0] == 0:
+        blk = block_allocator.allocate_any(1)[0]
+        root.direct[0] = block_allocator._get_absolute_block(blk)
+        root.blocks_allocated = 1
+        root.size = 0
+        disk.write_block(root.direct[0], new_directory_block(1, 1))
+    inode_table.write_inode(root)
+    d = Directory(root, inode_table, block_allocator, disk, tx_manager)
+    d._parent_inode_num = 1
+    return d

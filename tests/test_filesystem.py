@@ -17,7 +17,7 @@ from src import (
     CrashInjector, CrashMode, CrashPoint,
     create_disk_image, open_disk_image,
     TransBeginRecord,
-    DirectoryNotEmptyError
+    DirectoryNotEmptyError, TransactionContext
 )
 
 
@@ -131,6 +131,8 @@ class TestSuperblock:
 class TestBlockAllocator:
     def test_allocate_free(self, mounted_fs):
         allocator = mounted_fs.block_allocator
+        # metadata writes are only legal inside a transaction
+        mounted_fs.tx_manager.begin()
         
         # Allocate single block
         blocks = allocator.allocate(1)
@@ -150,9 +152,11 @@ class TestBlockAllocator:
         allocator.free(blocks2)
         for b in blocks2:
             assert not allocator.is_allocated(b)
+        mounted_fs.tx_manager.abort()
     
     def test_allocate_contiguous(self, mounted_fs):
         allocator = mounted_fs.block_allocator
+        mounted_fs.tx_manager.begin()
         
         # Allocate contiguous blocks
         blocks = allocator.allocate(5)
@@ -160,16 +164,19 @@ class TestBlockAllocator:
         # Check they're contiguous
         for i in range(1, 5):
             assert blocks[i] == blocks[i-1] + 1
+        mounted_fs.tx_manager.abort()
     
     def test_free_count(self, mounted_fs):
         allocator = mounted_fs.block_allocator
         initial_free = allocator.get_free_count()
+        mounted_fs.tx_manager.begin()
         
         blocks = allocator.allocate(10)
         assert allocator.get_free_count() == initial_free - 10
         
         allocator.free(blocks)
         assert allocator.get_free_count() == initial_free
+        mounted_fs.tx_manager.abort()
 
 
 # Inode Tests
@@ -206,6 +213,7 @@ class TestInode:
     
     def test_allocate_inode(self, mounted_fs):
         inode_table = mounted_fs.inode_table
+        mounted_fs.tx_manager.begin()
         
         inode = inode_table.allocate_inode(InodeType.FILE, 0o644)
         assert inode.type == InodeType.FILE
@@ -216,9 +224,11 @@ class TestInode:
         inode2 = inode_table.read_inode(inode.inode_num)
         assert inode2.type == InodeType.FILE
         assert inode2.inode_num == inode.inode_num
+        mounted_fs.tx_manager.abort()
     
     def test_free_inode(self, mounted_fs):
         inode_table = mounted_fs.inode_table
+        mounted_fs.tx_manager.begin()
         
         inode = inode_table.allocate_inode(InodeType.FILE)
         inode_num = inode.inode_num
@@ -232,6 +242,7 @@ class TestInode:
         # Should be free now
         inode2 = inode_table.read_inode(inode_num)
         assert inode2.is_free
+        mounted_fs.tx_manager.abort()
 
 
 # Directory Tests
@@ -254,6 +265,7 @@ class TestDirectory:
     
     def test_add_remove_entries(self, mounted_fs):
         root_dir = mounted_fs.root_dir
+        mounted_fs.tx_manager.begin()
         
         # Add entries
         root_dir.add_entry("file1.txt", 10, 1)  # File
@@ -274,15 +286,18 @@ class TestDirectory:
         entries = root_dir.list_entries()
         assert len(entries) == 1
         assert entries[0].name == "dir1"
+        mounted_fs.tx_manager.abort()
     
     def test_rename(self, mounted_fs):
         root_dir = mounted_fs.root_dir
+        mounted_fs.tx_manager.begin()
         root_dir.add_entry("old.txt", 20, 1)
         
         root_dir.rename_entry("old.txt", "new.txt")
         
         assert root_dir.lookup("old.txt") is None
         assert root_dir.lookup("new.txt") == 20
+        mounted_fs.tx_manager.abort()
 
 
 # Journal Tests
@@ -524,6 +539,133 @@ class TestCrashInjection:
             crash_triggered = True
         
         assert not crash_triggered
+
+
+# Crash Point Tests
+class TestCrashPoints:
+    """Test all crash points with transaction commit protocol."""
+    
+    EARLY_CRASH_POINTS = [
+        CrashPoint.BEFORE_JOURNAL_WRITE,
+        CrashPoint.AFTER_JOURNAL_WRITE,
+        CrashPoint.BEFORE_JOURNAL_FLUSH,
+        CrashPoint.AFTER_JOURNAL_FLUSH,
+        CrashPoint.BEFORE_COMMIT_WRITE,
+    ]
+    
+    MID_CRASH_POINTS = [
+        CrashPoint.AFTER_COMMIT_WRITE,
+        CrashPoint.BEFORE_COMMIT_FLUSH,
+        CrashPoint.AFTER_COMMIT_FLUSH,
+        CrashPoint.BEFORE_HOME_WRITE,
+    ]
+    
+    LATE_CRASH_POINTS = [
+        CrashPoint.AFTER_HOME_WRITE,
+        CrashPoint.BEFORE_HOME_FLUSH,
+        CrashPoint.AFTER_HOME_FLUSH,
+        CrashPoint.BEFORE_CHECKPOINT,
+        CrashPoint.AFTER_CHECKPOINT,
+    ]
+    
+    def _run_crash_test(self, temp_disk, crash_point, is_early, is_mid, is_late):
+        """Helper: create file, crash during write, verify recovery."""
+        # Step 1: Format and create a file (no crash injection)
+        # (this legacy matrix assumes the ORIGINAL write-through disk model; the strict
+        #  volatile-cache matrix lives in tests/test_crash_recovery.py)
+        fs = create_filesystem(temp_disk, disk_size=4*1024*1024, cache_mode="writethrough")
+        fs.create("/test.txt")
+        fs.unmount()
+        
+        # Step 2: Mount, enable crash injection, attempt write
+        fs = open_filesystem(temp_disk, cache_mode="writethrough")
+        injector = fs.enable_crash_injection(CrashMode.EXCEPTION)
+        injector.enable(crash_point)
+        
+        crashed = False
+        try:
+            fs.write("/test.txt", b"recovered_data")
+        except Exception:
+            crashed = True
+        
+        assert crashed, f"Expected crash at {crash_point.name} but no crash occurred"
+        fs.disable_crash_injection()
+        try:
+            fs.unmount()
+        except Exception:
+            pass
+        
+        # Step 3: Re-mount and verify
+        fs2 = open_filesystem(temp_disk, cache_mode="writethrough")
+        data = fs2.read("/test.txt")
+        
+        if is_early:
+            # Before commit: transaction should be discarded, data should be empty
+            assert data == b'', f"Early crash {crash_point.name}: expected empty data, got {data!r}"
+        elif is_mid or is_late:
+            # After commit: transaction should be replayed, data should be present
+            assert data == b"recovered_data", f"Crash {crash_point.name}: expected recovered_data, got {data!r}"
+        
+        fs2.unmount()
+    
+    @pytest.mark.parametrize("crash_point", EARLY_CRASH_POINTS)
+    def test_early_crash_point(self, temp_disk, crash_point):
+        """Test early crash points (before transaction commit)."""
+        self._run_crash_test(temp_disk, crash_point, is_early=True, is_mid=False, is_late=False)
+    
+    @pytest.mark.parametrize("crash_point", MID_CRASH_POINTS)
+    def test_mid_crash_point(self, temp_disk, crash_point):
+        """Test mid crash points (after commit, before apply/checkpoint)."""
+        self._run_crash_test(temp_disk, crash_point, is_early=False, is_mid=True, is_late=False)
+    
+    @pytest.mark.parametrize("crash_point", LATE_CRASH_POINTS)
+    def test_late_crash_point(self, temp_disk, crash_point):
+        """Test late crash points (after apply, before/after checkpoint)."""
+        self._run_crash_test(temp_disk, crash_point, is_early=False, is_mid=False, is_late=True)
+    
+    def test_all_crash_points_crash(self, temp_disk):
+        """Verify that each crash point actually triggers a crash."""
+        # Recovery-phase crash points only fire when recovery runs
+        recovery_points = {
+            CrashPoint.DURING_RECOVERY_SCAN,
+            CrashPoint.DURING_RECOVERY_REPLAY,
+            CrashPoint.AFTER_RECOVERY_REPLAY,
+        }
+        # Disk-level crash points don't trigger during normal operations
+        disk_only_points = {
+            CrashPoint.BEFORE_READ, CrashPoint.AFTER_READ,
+            CrashPoint.BEFORE_WRITE, CrashPoint.AFTER_WRITE,
+            CrashPoint.BEFORE_FLUSH, CrashPoint.AFTER_FLUSH,
+        }
+        skip_points = recovery_points | disk_only_points
+        
+        for cp in CrashPoint:
+            if cp == CrashPoint.NONE or cp in skip_points:
+                continue
+            fs = create_filesystem(temp_disk, disk_size=4*1024*1024)
+            fs.create("/test.txt")
+            fs.unmount()
+            
+            fs2 = open_filesystem(temp_disk)
+            injector = fs2.enable_crash_injection(CrashMode.EXCEPTION)
+            injector.enable(cp)
+            
+            crashed = False
+            try:
+                fs2.write("/test.txt", b"data")
+            except Exception:
+                crashed = True
+            
+            assert crashed, f"Crash point {cp.name} did not trigger a crash"
+            fs2.disable_crash_injection()
+            try:
+                fs2.unmount()
+            except Exception:
+                pass
+            
+            # Clean up for next iteration
+            import os
+            os.remove(temp_disk)
 
 
 # Consistency Checker Tests

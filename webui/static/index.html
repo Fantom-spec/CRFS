@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>CRFS Monitor</title>
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<div class="app">
+  <header class="top">
+    <div class="brand"><i></i>CRFS <small>crash-recoverable filesystem monitor</small></div>
+    <span class="sp"></span>
+    <label class="lbl" for="imgsel">Image</label>
+    <select id="imgsel" aria-label="Disk image"></select>
+    <button class="btn sm" id="btn-open">Open</button>
+    <button class="btn sm primary" id="btn-new">New image…</button>
+    <span id="mountpill"></span>
+  </header>
+  <nav class="side" id="nav" aria-label="Screens"></nav>
+  <main id="main" tabindex="-1"></main>
+</div>
+<div id="crashbar"></div>
+<div class="toasts" id="toasts" aria-live="polite"></div>
+<div id="modal-root"></div>
+<script src="/app.js"></script>
+</body>
+</html>

@@ -1,167 +1,70 @@
-# Crash-Recoverable File System Simulator - Architecture
-
-## Overview
-
-This document describes the architecture of a crash-recoverable file system simulator implemented in Python. The system implements a custom file system on top of a virtual disk image with write-ahead journaling for crash recovery.
-
-## Module Responsibilities
-
-### 1. virtual_disk.py
-- **Purpose**: Low-level disk image management
-- **Responsibilities**:
-  - Create, open, and close disk image files
-  - Fixed-size block reads/writes (4096 bytes default)
-  - Flush/sync operations for persistence guarantees
-  - Bounds checking for all block accesses
-  - Fault injection points for crash testing
-
-### 2. superblock.py
-- **Purpose**: Filesystem format metadata and validation
-- **Responsibilities**:
-  - Define on-disk superblock structure
-  - Magic number validation
-  - Format version checking
-  - Disk layout parameters (block size, total blocks, region offsets)
-  - Serialization/deserialization
-
-### 3. block_allocator.py
-- **Purpose**: Free-space bitmap management
-- **Responsibilities**:
-  - Bitmap allocation and deallocation
-  - Find free blocks
-  - Allocation verification
-  - Bitmap persistence
-
-### 4. inode.py
-- **Purpose**: Inode management and serialization
-- **Responsibilities**:
-  - Inode structure definition (type, permissions, timestamps, size, block pointers)
-  - Inode serialization/deserialization
-  - Direct block pointer management
-  - Inode allocation and reclamation
-
-### 5. directory.py
-- **Purpose**: Directory entry management
-- **Responsibilities**:
-  - Directory entry structure (name, inode number)
-  - Directory entry serialization
-  - Name-to-inode mapping within directory blocks
-  - Directory operations (add, remove, lookup, list)
-
-### 6. journal.py
-- **Purpose**: Write-ahead journal management
-- **Responsibilities**:
-  - Transaction record format (header, metadata after-images, checksums)
-  - Commit record format
-  - Journal bounds and wraparound
-  - Record validation with checksums
-  - Journal space management
-
-### 7. transaction.py
-- **Purpose**: Transaction lifecycle management
-- **Responsibilities**:
-  - Transaction begin/commit/abort
-  - Ordered writes to journal
-  - Metadata change tracking
-  - Flush synchronization points
-  - Crash point injection
-
-### 8. recovery.py
-- **Purpose**: Crash recovery and journal replay
-- **Responsibilities**:
-  - Journal scanning and validation
-  - Committed transaction identification
-  - Incomplete transaction detection and discard
-  - Idempotent replay of committed transactions
-  - Checkpoint management
-
-### 9. consistency_checker.py
-- **Purpose**: Filesystem integrity validation
-- **Responsibilities**:
-  - Superblock validation
-  - Inode and bitmap consistency
-  - Directory hierarchy validation
-  - Block ownership verification
-  - Journal structure validation
-
-### 10. crash_injector.py
-- **Purpose**: Deterministic crash injection for testing
-- **Responsibilities**:
-  - Crash point definitions
-  - In-process crash simulation (exception-based)
-  - Subprocess crash mode (SIGKILL)
-  - Crash scenario orchestration
-
-### 11. filesystem.py
-- **Purpose**: High-level filesystem operations
-- **Responsibilities**:
-  - Path resolution
-  - File/directory creation, deletion, renaming
-  - Read/write/append operations
-  - Mount/unmount with recovery
-  - Namespace management
-
-### 12. cli.py
-- **Purpose**: Command-line interface
-- **Responsibilities**:
-  - Interactive shell and single-command modes
-  - Command parsing and dispatch
-  - User-facing error messages
-  - Help system
-
-## Disk Layout
+# Architecture
 
 ```
-+------------------+  Block 0
-|    Superblock    |  (1 block)
-+------------------+  Block 1
-|    Journal       |  N blocks (configurable, default 128)
-+------------------+  Block 1 + N
-|    Bitmap        |  M blocks (1 bit per data block)
-+------------------+  Block 1 + N + M
-|    Inode Table   |  K blocks (fixed-size inode array)
-+------------------+  Block 1 + N + M + K
-|    Data Blocks   |  Remaining blocks
-|  (files/dirs)    |
-+------------------+
+            +-----------------------+     +-----------------+
+ Browser -> | webui/app.py (HTTP)   |     | src/cli.py      |
+            | token, Host check,    |     | shell / -c      |
+            | typed confirmations   |     +--------+--------+
+            +----------+------------+              |
+                       |   (only public FileSystem API)
+                       v                           v
+                +--------------------------------------------+
+                |  src/filesystem.py  FileSystem             |
+                |  create mkdir write append read delete     |
+                |  rename ls stat tree fsck recover overview |
+                +--------+-----------------------+-----------+
+                         |                       |
+            +------------v---------+   +---------v-----------+
+            | transaction.py       |   | consistency_checker |
+            | TransactionManager   |   | (read-only fsck)    |
+            | StagingIO overlay    |   +---------------------+
+            +----+-------------+---+
+                 |             |
+        +--------v---+   +-----v--------+   +--------------+
+        | journal.py |   | recovery.py  |   | events.py    |
+        | records,   |   | scan+replay  |   | EventLog     |
+        | ring, CRC  |   +--------------+   +--------------+
+        +-----+------+
+              v
+        +-------------------------------+
+        | virtual_disk.py               |
+        | block I/O, volatile cache,    |
+        | flush(), crash(), fire(point) |
+        +---------------+---------------+
+                        v
+                  disk image file
 ```
 
-## Transaction Protocol
+## Modules
 
-### Write-Ahead Journaling (Redo Logging)
+| Module | Responsibility |
+|---|---|
+| `virtual_disk.py` | Block device on a file. Two models: `volatile` (writes sit in a cache until `flush`, a crash drops them) and `writethrough`. Fires named crash points; can persist a torn prefix of one block. |
+| `superblock.py` | Format metadata, journal tail/head, checkpoint txid, CRC64. |
+| `block_allocator.py`, `inode.py`, `directory.py` | Bitmap, inode table, directory blocks. All reads/writes go through an `io` object so inside a transaction they hit the staging overlay. |
+| `journal.py` | Record encoding, circular ring, scan with sequence validation, idempotent replay. |
+| `transaction.py` | `begin/commit/abort`. `StagingIO` rejects metadata writes made outside a transaction. Drives the 5-step commit protocol and fires crash points. |
+| `recovery.py` | Mount-time redo of committed transactions; `recover()` returns a structured `RecoveryResult`. |
+| `consistency_checker.py` | fsck: superblock, journal, bitmap vs inodes, tree reachability, link counts; every finding has a `code` and a `why`. |
+| `events.py` | Bounded in-memory event log with optional JSONL sink. Used by UI and lab. |
+| `crash_injector.py` | `CrashScenario` table (14 scenarios) and the injector (`EXCEPTION`, `SUBPROCESS` = `SIGKILL`). |
+| `crash_worker.py` / `crash_lab.py` | The lab: runs `setup`, `crash`, `inspect`, `verify` as **separate processes**; compares expected vs actual. |
+| `webui/app.py` | Stdlib `ThreadingHTTPServer`; JSON API + static files. |
 
-1. **Prepare**: Collect all metadata changes for the operation
-2. **Journal Write**: Write transaction records with after-images to journal
-3. **Journal Flush**: `fsync` journal records to disk
-4. **Commit Record**: Write commit record with transaction ID
-5. **Commit Flush**: `fsync` commit record
-6. **Apply**: Write metadata after-images to home locations
-7. **Home Flush**: `fsync` home locations
-8. **Checkpoint**: Advance journal head, reclaim space
+## UI/backend boundary
 
-### Crash Recovery
-
-1. Validate superblock and journal bounds
-2. Scan journal from last checkpoint
-3. Validate records using checksums and lengths
-4. Identify committed transactions (valid commit record)
-5. Replay committed transactions (idempotent)
-6. Flush recovered metadata
-7. Update checkpoint
-8. Run consistency checker
-
-## Durability Assumptions
-
-- Host filesystem provides `fsync` durability for the disk image file
-- Block writes are atomic at the block level (4096 bytes)
-- Write ordering is preserved by `fsync` barriers
-- Power loss during write may cause torn blocks (handled by checksums)
-- Journal records include checksums to detect corruption
-
-## Testing Strategy
-
-- Unit tests for each module
-- Integration tests for filesystem operations
-- Crash injection tests at every protocol stage
-- Consistency checker validation after each recovery
-- Automated test suite with deterministic seeds
+* The UI is static HTML/JS. It never reads or writes an image; every action is an HTTP call that ends in a
+  public `FileSystem` method (or the lab, which spawns worker processes on a *temporary* image).
+* Every number shown comes from `/api/state`, `/api/layout`, `/api/block`, `/api/journal`, `/api/check`,
+  `/api/events`, `/api/lab/*`. There is no sample data in the dashboard.
+* Engine exceptions become `{"ok": false, "error": {"type", "message"}}` with a 4xx/5xx status and appear
+  as toasts.
+* Long work (crash lab) runs in a background thread; the UI polls `/api/lab/job`.
+* Security: binds to loopback only (non-loopback hosts are refused at startup), `Host` header must be a
+  loopback name, every POST needs a per-process token (`X-CRFS-Token`), image names are restricted to
+  `[A-Za-z0-9._-]{1,64}.img` inside one directory, destructive calls need an exact confirmation string
+  (`FORMAT <name>`, `DELETE <name>`, `RUN CRASH LAB`), request bodies are capped at 256 KiB. There is no
+  shell or arbitrary-path endpoint. The only endpoint that crashes the *mounted* image is `/api/demo/crash`
+  (typed confirmation `CRASH THIS IMAGE`, runs in a separate process, leaves the image mounted read-only
+  until recovery).
+* The CLI and UI use the same engine and the same on-disk format; an image made by one opens in the other.

@@ -9,7 +9,6 @@ import time
 from dataclasses import dataclass, field
 from typing import List, Optional, Tuple
 from enum import IntEnum
-from .virtual_disk import VirtualDisk
 from .superblock import Superblock
 
 
@@ -113,6 +112,10 @@ class Inode:
     @property
     def is_free(self) -> bool:
         return self.type == InodeType.FREE
+    
+    @is_free.setter
+    def is_free(self, value: bool) -> None:
+        self.type = InodeType.FREE if value else self.type
     
     @property
     def is_file(self) -> bool:
@@ -273,198 +276,120 @@ class Inode:
 
 
 class InodeTable:
-    """Manages the inode table on disk."""
-    
-    def __init__(self, disk: VirtualDisk, superblock: Superblock):
+    """
+    The on-disk inode table.  Every read/write goes through ``self.disk``
+    (the transaction-staging proxy in a mounted filesystem); nothing is cached.
+    """
+
+    def __init__(self, disk, superblock: Superblock):
         self.disk = disk
         self.superblock = superblock
-        self._inode_cache: dict[int, Inode] = {}
-        self._cache_dirty: set[int] = set()
-    
+
     def _get_inode_location(self, inode_num: int) -> Tuple[int, int]:
-        """
-        Get block number and offset for an inode.
-        
-        Returns:
-            (block_num, offset_within_block)
-        """
+        """(block_num, offset_within_block) of an inode."""
         if inode_num <= 0 or inode_num > self.superblock.total_inodes:
-            raise InvalidInodeError(f"Inode number {inode_num} out of range [1, {self.superblock.total_inodes}]")
-        
-        # Inode 1 is at index 0 in the table
+            raise InvalidInodeError(
+                f"Inode number {inode_num} out of range [1, {self.superblock.total_inodes}]")
         index = inode_num - 1
-        block_offset = index // INODES_PER_BLOCK
-        inode_offset = index % INODES_PER_BLOCK
-        
-        block_num = self.superblock.inode_table_start_block + block_offset
-        offset = inode_offset * INODE_SIZE
-        
-        return block_num, offset
-    
+        block_num = self.superblock.inode_table_start_block + index // INODES_PER_BLOCK
+        return block_num, (index % INODES_PER_BLOCK) * INODE_SIZE
+
     def read_inode(self, inode_num: int, use_cache: bool = True) -> Inode:
-        """Read an inode from disk."""
-        if use_cache and inode_num in self._inode_cache:
-            return self._inode_cache[inode_num]
-        
+        """Read an inode (``use_cache`` is accepted for compatibility and ignored)."""
         block_num, offset = self._get_inode_location(inode_num)
-        block_data = self.disk.read_block(block_num)
-        inode_data = block_data[offset:offset + INODE_SIZE]
-        inode = Inode.from_bytes(inode_data, inode_num)
-        
-        if use_cache:
-            self._inode_cache[inode_num] = inode
-        
-        return inode
-    
+        raw = self.disk.read_block(block_num)[offset:offset + INODE_SIZE]
+        try:
+            return Inode.from_bytes(raw, inode_num)
+        except ValueError as e:
+            raise InvalidInodeError(f"Inode {inode_num} is corrupt: {e}") from e
+
     def write_inode(self, inode: Inode) -> None:
-        """Write an inode to disk."""
-        if inode.inode_num <= 0 or inode.inode_num >= self.superblock.total_inodes:
-            raise InvalidInodeError(f"Inode number {inode.inode_num} out of range")
-        
         block_num, offset = self._get_inode_location(inode.inode_num)
-        
-        # Read the block, modify inode, write back
-        block_data = bytearray(self.disk.read_block(block_num))
-        inode_bytes = inode.to_bytes()
-        block_data[offset:offset + INODE_SIZE] = inode_bytes
-        self.disk.write_block(block_num, bytes(block_data))
-        
-        # Update cache
-        self._inode_cache[inode.inode_num] = inode
+        block = bytearray(self.disk.read_block(block_num))
+        block[offset:offset + INODE_SIZE] = inode.to_bytes()
+        self.disk.write_block(block_num, bytes(block))
         inode._dirty = False
-    
-    def allocate_inode(self, inode_type: InodeType, mode: int = 0o644) -> Inode:
-        """Allocate a new inode."""
-        if self.superblock.free_inode_count <= 0:
+
+    def stage_inode(self, inode: Inode, tx_manager=None) -> None:
+        """Kept for compatibility: writes go through the staging proxy."""
+        self.write_inode(inode)
+
+    def _find_free(self) -> Inode:
+        sb = self.superblock
+        if sb.free_inode_count <= 0:
             raise InodeTableFullError("No free inodes available")
-        
-        # Search from next_free_inode
-        start = self.superblock.next_free_inode
-        inode_num = start
+        start = min(max(sb.next_free_inode, 1), sb.total_inodes)
+        num = start
         while True:
-            inode = self.read_inode(inode_num, use_cache=False)
+            inode = self.read_inode(num)
             if inode.is_free:
-                # Found free inode
-                now = time.time_ns()
-                inode.type = inode_type
-                inode.mode = mode
-                inode.uid = 0
-                inode.gid = 0
-                inode.size = 0
-                inode.blocks_allocated = 0
-                inode.ctime = now
-                inode.mtime = now
-                inode.atime = now
-                inode.chtime = now
-                inode.direct = [0] * DIRECT_POINTERS
-                inode.indirect1 = 0
-                inode.indirect2 = 0
-                inode.indirect3 = 0
-                inode.link_count = 1 if inode_type == InodeType.FILE else 2
-                inode.flags = 0
-                inode.generation += 1
-                inode._dirty = True
-                
-                self.write_inode(inode)
-                
-                # Update superblock
-                self.superblock.free_inode_count -= 1
-                self.superblock.next_free_inode = inode_num + 1
-                if self.superblock.next_free_inode > self.superblock.total_inodes:
-                    self.superblock.next_free_inode = 1
-                self.superblock._dirty = True
-                
                 return inode
-            
-            # Move to next inode
-            inode_num += 1
-            if inode_num > self.superblock.total_inodes:
-                inode_num = 1
-            
-            # Check if we've wrapped around completely
-            if inode_num == start:
-                break
-        
-        raise InodeTableFullError("No free inodes found (should not happen)")
-    
+            num = num + 1 if num < sb.total_inodes else 1
+            if num == start:
+                raise InodeTableFullError("No free inodes available")
+
+    def allocate_inode(self, inode_type: InodeType, mode: int = 0o644) -> Inode:
+        """Allocate and write a fresh inode (must run inside a transaction)."""
+        inode_type = InodeType(inode_type)
+        inode = self._find_free()
+        now = time.time_ns()
+        gen = inode.generation + 1
+        inode = Inode(inode_num=inode.inode_num, type=inode_type, mode=mode,
+                      ctime=now, mtime=now, atime=now, chtime=now,
+                      link_count=1 if inode_type == InodeType.FILE else 2,
+                      generation=gen)
+        self.write_inode(inode)
+        sb = self.superblock
+        sb.free_inode_count -= 1
+        sb.next_free_inode = inode.inode_num + 1 if inode.inode_num < sb.total_inodes else 1
+        sb._dirty = True
+        return inode
+
+    stage_allocate = lambda self, inode_type, mode, tx_manager=None: self.allocate_inode(inode_type, mode)
+
     def free_inode(self, inode_num: int) -> None:
-        """Free an inode."""
         inode = self.read_inode(inode_num)
-        
         if inode.is_free:
             raise InvalidInodeError(f"Inode {inode_num} already free")
-        
         if inode.link_count > 0:
             raise InvalidInodeError(f"Inode {inode_num} still has {inode.link_count} links")
-        
-        # Clear inode
-        inode.type = InodeType.FREE
-        inode.mode = 0
-        inode.uid = 0
-        inode.gid = 0
-        inode.size = 0
-        inode.blocks_allocated = 0
-        inode.ctime = 0
-        inode.mtime = 0
-        inode.atime = 0
-        inode.chtime = 0
-        inode.direct = [0] * DIRECT_POINTERS
-        inode.indirect1 = 0
-        inode.indirect2 = 0
-        inode.indirect3 = 0
-        inode.link_count = 0
-        inode.flags = 0
-        inode._dirty = True
-        
-        self.write_inode(inode)
-        
-        # Update superblock
+        # keep the generation counter, clear everything else
+        self.write_inode(Inode(inode_num=inode_num, type=InodeType.FREE,
+                               generation=inode.generation))
         self.superblock.free_inode_count += 1
         self.superblock._dirty = True
-        
-        # Remove from cache
-        self._inode_cache.pop(inode_num, None)
-    
+
     def flush_dirty(self) -> None:
-        """Flush all dirty cached inodes."""
-        for inode_num in list(self._cache_dirty):
-            inode = self._inode_cache.get(inode_num)
-            if inode and inode._dirty:
-                self.write_inode(inode)
-        self._cache_dirty.clear()
-    
+        """No-op (kept for compatibility): nothing is cached."""
+
     def get_inode(self, inode_num: int) -> Inode:
-        """Get inode from cache or disk."""
         return self.read_inode(inode_num)
-    
+
     def iter_inodes(self) -> List[Inode]:
-        """Iterate over all allocated inodes."""
         result = []
-        for inode_num in range(1, self.superblock.total_inodes + 1):
-            inode = self.read_inode(inode_num, use_cache=False)
+        for n in range(1, self.superblock.total_inodes + 1):
+            try:
+                inode = self.read_inode(n)
+            except InvalidInodeError:
+                continue
             if not inode.is_free:
                 result.append(inode)
         return result
-    
+
     def get_stats(self) -> dict:
-        """Get inode table statistics."""
-        allocated = 0
-        files = 0
-        dirs = 0
-        for inode_num in range(1, self.superblock.total_inodes + 1):
-            inode = self.read_inode(inode_num, use_cache=False)
-            if not inode.is_free:
-                allocated += 1
-                if inode.is_file:
-                    files += 1
-                elif inode.is_directory:
-                    dirs += 1
+        allocated = files = dirs = 0
+        for inode in self.iter_inodes():
+            allocated += 1
+            if inode.is_file:
+                files += 1
+            elif inode.is_directory:
+                dirs += 1
         return {
-            'total_inodes': self.superblock.total_inodes,
-            'free_inodes': self.superblock.free_inode_count,
-            'allocated': allocated,
-            'files': files,
-            'directories': dirs,
+            "total_inodes": self.superblock.total_inodes,
+            "free_inodes": self.superblock.free_inode_count,
+            "allocated": allocated,
+            "files": files,
+            "directories": dirs,
         }
 
 

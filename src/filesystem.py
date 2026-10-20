@@ -1,74 +1,115 @@
 """
 Filesystem Module
 
-High-level filesystem operations and namespace management.
+High-level operations.  EVERY mutating operation runs inside a journaled
+transaction (see transaction.py); an operation either commits completely or
+leaves no trace.
 """
 
-import os
 import time
-from typing import List, Optional, Tuple, BinaryIO
-from .virtual_disk import VirtualDisk, create_disk_image, open_disk_image
+from contextlib import contextmanager
+from typing import Any, Dict, List, Optional, Tuple
+
+from .block_allocator import BlockAllocator, NoFreeBlocksError, create_initial_bitmap
+from .consistency_checker import CheckResult, ConsistencyChecker
+from .crash_injector import (CrashInjector, CrashMode, get_global_injector,
+                             maybe_crash, set_global_injector)
+from .directory import (DIR_ENTRY_SIZE, DIR_TYPE_DIR, DIR_TYPE_FILE, CorruptDirectoryError,
+                        Directory, DirectoryError, DirectoryFullError, DirEntry,
+                        InvalidNameError, initialize_root_directory, new_directory_block,
+                        validate_name)
+from .events import EventLog
+from .inode import (DIRECT_POINTERS, INODE_SIZE, INODES_PER_BLOCK, MAX_FILE_SIZE, Inode,
+                    InodeTable, InodeTableFullError, InodeType, InvalidInodeError)
+from .journal import Journal, JournalError, JournalFullError
+from .recovery import RecoveryManager, RecoveryResult, run_recovery
 from .superblock import Superblock, SuperblockManager
-from .block_allocator import BlockAllocator, create_initial_bitmap
-from .inode import Inode, InodeTable, InodeType, create_root_inode, DIRECT_POINTERS
-from .journal import Journal
-from .transaction import TransactionManager, TransactionContext
-from .recovery import RecoveryManager, run_recovery
-from .consistency_checker import ConsistencyChecker, run_consistency_check
-from .directory import Directory, DirEntry, DIR_TYPE_DIR, DIR_TYPE_FILE, initialize_root_directory
-from .crash_injector import CrashInjector, CrashMode, get_global_injector, set_global_injector, maybe_crash
+from .transaction import (ReadOnlyError, StagingIO, TransactionContext, TransactionError,
+                          TransactionManager)
+from .virtual_disk import (CrashInjectedError, DiskNotOpenError, VirtualDisk, VirtualDiskError,
+                           create_disk_image, open_disk_image)
 
 
 class FileSystemError(Exception):
     """Base exception for filesystem errors."""
-    pass
 
 
 class PathError(FileSystemError):
-    """Raised for path-related errors."""
     pass
 
 
 class NotFoundError(FileSystemError):
-    """Raised when file/directory not found."""
     pass
 
 
 class AlreadyExistsError(FileSystemError):
-    """Raised when file/directory already exists."""
     pass
 
 
 class NotDirectoryError(FileSystemError):
-    """Raised when path is not a directory."""
     pass
 
 
 class IsDirectoryError(FileSystemError):
-    """Raised when path is a directory but file expected."""
     pass
 
 
 class DirectoryNotEmptyError(FileSystemError):
-    """Raised when directory not empty."""
     pass
 
 
 class DiskFullError(FileSystemError):
-    """Raised when disk is full."""
     pass
 
 
+class FileTooLargeError(FileSystemError):
+    pass
+
+
+class MountError(FileSystemError):
+    pass
+
+
+class NotMountedError(FileSystemError):
+    pass
+
+
+class ReadOnlyFilesystemError(FileSystemError):
+    pass
+
+
+def _map_error(e: Exception) -> Exception:
+    """Translate low-level engine errors into user-facing FileSystemErrors."""
+    if isinstance(e, FileSystemError):
+        return e
+    if isinstance(e, NoFreeBlocksError):
+        return DiskFullError(f"disk full: {e}")
+    if isinstance(e, InodeTableFullError):
+        return DiskFullError(f"no free inodes: {e}")
+    if isinstance(e, DirectoryFullError):
+        return DiskFullError(f"directory full: {e}")
+    if isinstance(e, JournalFullError):
+        return FileSystemError(f"journal full: {e}")
+    if isinstance(e, InvalidNameError):
+        return PathError(str(e))
+    if isinstance(e, ReadOnlyError):
+        return ReadOnlyFilesystemError(str(e))
+    if isinstance(e, CorruptDirectoryError):
+        return FileSystemError(f"corrupt directory: {e}")
+    if isinstance(e, DiskNotOpenError):
+        return NotMountedError(str(e))
+    return e
+
+
 class FileSystem:
-    """
-    Main filesystem interface.
-    
-    Provides high-level operations: format, mount, create, read, write, etc.
-    """
-    
-    def __init__(self, disk_path: str):
+    def __init__(self, disk_path: str, cache_mode: str = "volatile",
+                 checkpoint: str = "eager", events: Optional[EventLog] = None):
         self.disk_path = disk_path
+        self.cache_mode = cache_mode
+        self.checkpoint_policy = checkpoint
+        self.events = events if events is not None else EventLog()
         self.disk: Optional[VirtualDisk] = None
+        self.io: Optional[StagingIO] = None
         self.superblock: Optional[Superblock] = None
         self.superblock_mgr: Optional[SuperblockManager] = None
         self.block_allocator: Optional[BlockAllocator] = None
@@ -77,593 +118,649 @@ class FileSystem:
         self.tx_manager: Optional[TransactionManager] = None
         self.recovery_mgr: Optional[RecoveryManager] = None
         self.checker: Optional[ConsistencyChecker] = None
-        self.root_dir: Optional[Directory] = None
         self._mounted = False
         self._crash_injector: Optional[CrashInjector] = None
-    
-    def format(
-        self,
-        disk_size: int = 16 * 1024 * 1024,
-        block_size: int = 4096,
-        journal_blocks: int = 128,
-        inode_blocks: int = 64,
-        volume_label: str = ""
-    ) -> None:
-        """Format a new filesystem."""
-        # Create disk image
-        self.disk = create_disk_image(self.disk_path, block_size, disk_size)
-        
-        # Create superblock
+        self.last_recovery: Optional[RecoveryResult] = None
+        self.last_check: Optional[Dict[str, Any]] = None
+
+    # =================================================================== setup
+    def _init_components(self) -> None:
+        self.io = StagingIO(self.disk)
+        self.block_allocator = BlockAllocator(self.io, self.superblock)
+        self.inode_table = InodeTable(self.io, self.superblock)
+        self.journal = Journal(self.disk, self.superblock)
+        self.tx_manager = TransactionManager(self.disk, self.superblock, self.journal,
+                                             self.inode_table, self.block_allocator, io=self.io)
+        self.tx_manager.checkpoint_policy = self.checkpoint_policy
+        self.recovery_mgr = RecoveryManager(self.disk, self.superblock, self.journal,
+                                            self.inode_table, self.block_allocator)
+        self.checker = ConsistencyChecker(self.disk, self.superblock, self.inode_table,
+                                          self.block_allocator, self.journal)
+        for c in (self.journal, self.tx_manager, self.recovery_mgr):
+            c.events = self.events
+
+    @property
+    def root_dir(self) -> Directory:
+        return self._dir(1)
+
+    def _dir(self, inode_num: int) -> Directory:
+        inode = self.inode_table.read_inode(inode_num)
+        d = Directory(inode, self.inode_table, self.block_allocator, self.io)
+        if inode_num == 1:
+            d._parent_inode_num = 1
+        return d
+
+    def format(self, disk_size: int = 16 * 1024 * 1024, block_size: int = 4096,
+               journal_blocks: int = 128, inode_blocks: int = 64, volume_label: str = "") -> None:
+        if block_size != 4096:
+            raise ValueError("only 4096-byte blocks are supported")
+        if journal_blocks < 4:
+            raise ValueError("journal needs at least 4 blocks")
+        if inode_blocks < 1:
+            raise ValueError("need at least 1 inode-table block")
+        if disk_size // block_size < journal_blocks + inode_blocks + 8:
+            raise ValueError("disk too small for the requested journal / inode table")
+        if self.disk is not None and self.disk.is_open:
+            self.disk.close()
+        self.disk = create_disk_image(self.disk_path, block_size, disk_size, self.cache_mode)
         self.superblock_mgr = SuperblockManager(self.disk)
         self.superblock = self.superblock_mgr.create_default(
-            disk_size=disk_size,
-            journal_blocks=journal_blocks,
-            inode_blocks=inode_blocks,
-            volume_label=volume_label
-        )
-        
-        # Write superblock
-        self.superblock_mgr.write()
-        
-        # Initialize bitmap
-        create_initial_bitmap(self.disk, self.superblock)
-        
-        # Initialize inode table (zero out)
-        inode_table_start = self.superblock.inode_table_start_block
-        inode_table_blocks = self.superblock.inode_table_block_count
-        zero_data = b'\x00' * (inode_table_blocks * 4096)
-        self.disk.write_blocks(inode_table_start, zero_data)
-        
-        # Initialize components
+            disk_size=disk_size, journal_blocks=journal_blocks,
+            inode_blocks=inode_blocks, volume_label=volume_label)
         self._init_components()
-        
-        # Create root directory
-        self.root_dir = initialize_root_directory(
-            self.inode_table, self.block_allocator, self.disk
-        )
-        
-        # Write initial checkpoint
-        self.journal.write_checkpoint(0)
+        self.io.allow_raw_writes = True
+        self.superblock_mgr.write()
+        create_initial_bitmap(self.disk, self.superblock)
         self.disk.flush()
-        
+        self.io.allow_raw_writes = False
+        # the root directory is created through a normal journaled transaction
+        with TransactionContext(self.tx_manager):
+            initialize_root_directory(self.inode_table, self.block_allocator, self.io, self.tx_manager)
         self._mounted = True
-    
-    def mount(self, run_recovery: bool = True) -> None:
-        """Mount an existing filesystem."""
+        self.events.emit("mount", f"formatted and mounted {self.disk_path}", cache_mode=self.cache_mode)
+
+    def mount(self, run_recovery: bool = True, pre_recovery_hook=None) -> None:
         if self._mounted:
             raise FileSystemError("Already mounted")
-        
-        # Open disk
-        self.disk = open_disk_image(self.disk_path)
-        
-        # Read superblock
-        self.superblock_mgr = SuperblockManager(self.disk)
-        self.superblock = self.superblock_mgr.read()
-        
-        # Initialize components
+        try:
+            self.disk = open_disk_image(self.disk_path, cache_mode=self.cache_mode)
+        except FileNotFoundError as e:
+            raise MountError(str(e)) from e
+        try:
+            self.superblock_mgr = SuperblockManager(self.disk)
+            self.superblock = self.superblock_mgr.read()
+        except (ValueError, VirtualDiskError) as e:
+            self.disk.close()
+            raise MountError(f"not a valid CRFS image: {e}") from e
         self._init_components()
-        
-        # Run recovery if needed
-        if run_recovery and self.recovery_mgr.needs_recovery():
+        if pre_recovery_hook is not None:
+            pre_recovery_hook(self)      # e.g. arm a crash injector before recovery runs
+        if run_recovery:
             result = self.recovery_mgr.recover()
+            self.last_recovery = result
             if not result.success:
+                self.disk.close()
                 raise FileSystemError(f"Recovery failed: {result.errors}")
-        
-        # Open root directory
-        root_inode = self.inode_table.read_inode(1)
-        self.root_dir = Directory(root_inode, self.inode_table, self.block_allocator, self.disk)
-        
+        else:
+            self.tx_manager.read_only = True
+            self.events.emit("mount", "mounted READ-ONLY without recovery", severity="warning")
+        try:
+            self.inode_table.read_inode(1)
+        except Exception as e:
+            self.disk.close()
+            raise MountError(f"root inode unreadable: {e}") from e
         self._mounted = True
-    
-    def _init_components(self) -> None:
-        """Initialize filesystem components."""
-        self.block_allocator = BlockAllocator(self.disk, self.superblock)
-        self.inode_table = InodeTable(self.disk, self.superblock)
-        self.journal = Journal(self.disk, self.superblock)
-        self.tx_manager = TransactionManager(
-            self.disk, self.superblock, self.journal,
-            self.inode_table, self.block_allocator
-        )
-        self.recovery_mgr = RecoveryManager(
-            self.disk, self.superblock, self.journal,
-            self.inode_table, self.block_allocator
-        )
-        self.checker = ConsistencyChecker(
-            self.disk, self.superblock, self.inode_table,
-            self.block_allocator, self.journal
-        )
-    
+        self.events.emit("mount", f"mounted {self.disk_path}", cache_mode=self.cache_mode,
+                         recovered=bool(self.last_recovery and self.last_recovery.transactions_replayed))
+
     def unmount(self) -> None:
-        """Unmount filesystem."""
         if not self._mounted:
             return
-        
-        # Flush any pending writes
-        if self.tx_manager and self.tx_manager.is_active():
-            self.tx_manager.abort()
-        
-        self.superblock_mgr.sync_if_dirty()
-        self.block_allocator.flush()
-        self.inode_table.flush_dirty()
-        self.disk.flush()
-        self.disk.close()
-        
-        self._mounted = False
-    
-    def __enter__(self) -> 'FileSystem':
+        try:
+            if self.disk is None or self.disk.dead or not self.disk.is_open:
+                pass
+            else:
+                if self.tx_manager.is_active():
+                    self.tx_manager.abort()
+                if self.journal.uncheckpointed and not self.tx_manager.read_only:
+                    self.journal.checkpoint()
+                self.disk.flush()
+                self.disk.close()
+        finally:
+            if self.disk is not None and self.disk.is_open:
+                self.disk.close()
+            self._mounted = False
+            self.events.emit("unmount", "unmounted")
+
+    def __enter__(self) -> "FileSystem":
         return self
-    
+
     def __exit__(self, exc_type, exc_val, exc_tb) -> None:
         self.unmount()
-    
+
     @property
     def is_mounted(self) -> bool:
         return self._mounted
-    
-    # Crash injection
+
+    def _require_mounted(self) -> None:
+        if not self._mounted:
+            raise NotMountedError("filesystem is not mounted")
+
+    # ========================================================== crash injection
     def enable_crash_injection(self, mode: CrashMode = CrashMode.EXCEPTION) -> CrashInjector:
-        """Enable crash injection."""
-        self._crash_injector = CrashInjector(mode)
-        set_global_injector(self._crash_injector)
-        self.tx_manager.set_crash_callback(self._crash_injector._crash_callback)
-        self.recovery_mgr.set_crash_callback(self._crash_injector._crash_callback)
-        return self._crash_injector
-    
+        inj = CrashInjector(mode)
+        inj.attach_disk(self.disk)
+        inj.events = self.events
+        self._crash_injector = inj
+        set_global_injector(inj)
+        self.disk.set_crash_callback(inj.maybe_crash)
+        return inj
+
     def disable_crash_injection(self) -> None:
-        """Disable crash injection."""
         if self._crash_injector:
             self._crash_injector.disable()
+        if self.disk is not None:
+            self.disk.set_crash_callback(None)
         self._crash_injector = None
-    
-    # Path resolution
-    def _resolve_path(self, path: str, create_parent: bool = False) -> Tuple[Directory, str, Optional[int]]:
-        """
-        Resolve a path to (parent_directory, basename, inode_num).
-        
-        Returns:
-            (parent_dir, basename, existing_inode_num or None)
-        """
-        if not path or path == "/":
-            raise PathError("Invalid path: root")
-        
-        # Normalize path
-        path = path.rstrip("/")
-        parts = path.split("/")
-        
-        if parts[0] == "":
-            parts = parts[1:]  # Remove leading empty from "/foo"
-        
-        if not parts:
-            raise PathError("Invalid path")
-        
-        basename = parts[-1]
-        dir_parts = parts[:-1]
-        
-        # Start from root
-        current_dir = self.root_dir
-        current_inode = 1
-        
-        # Traverse directory components
-        for part in dir_parts:
-            if not part:
-                continue
-            
-            entry = current_dir.get_entry(part)
-            if entry is None:
-                if create_parent and part == dir_parts[-1]:
-                    # Will be created by caller
-                    break
-                raise NotFoundError(f"Path not found: {part}")
-            
-            inode = self.inode_table.read_inode(entry.inode_num)
+
+    # ======================================================== path resolution
+    @staticmethod
+    def _split(path: str) -> List[str]:
+        if not isinstance(path, str):
+            raise PathError("path must be a string")
+        parts = [p for p in path.strip().split("/") if p != ""]
+        for p in parts:
+            if p in (".", ".."):
+                raise PathError("'.' and '..' are not supported in paths")
+            if "\x00" in p:
+                raise PathError("NUL in path")
+        return parts
+
+    def _resolve_dir(self, parts: List[str], shown: str) -> Directory:
+        d = self._dir(1)
+        walked = ""
+        for part in parts:
+            walked += "/" + part
+            e = d.get_entry(part)
+            if e is None:
+                raise NotFoundError(f"No such directory: {walked}")
+            inode = self.inode_table.read_inode(e.inode_num)
             if not inode.is_directory:
-                raise NotDirectoryError(f"Not a directory: {part}")
-            
-            current_dir = Directory(inode, self.inode_table, self.block_allocator, self.disk)
-            current_inode = entry.inode_num
-        
-        # Check if target exists
-        target_inode = None
-        if basename:
-            entry = current_dir.get_entry(basename)
-            if entry:
-                target_inode = entry.inode_num
-        
-        return current_dir, basename, target_inode
-    
-    # Filesystem operations
+                raise NotDirectoryError(f"Not a directory: {walked}")
+            d = self._dir(e.inode_num)
+        return d
+
+    def _resolve_path(self, path: str) -> Tuple[Directory, str, Optional[int]]:
+        """(parent directory, final name, inode number or None)."""
+        parts = self._split(path)
+        if not parts:
+            raise PathError("Invalid path: root")
+        parent = self._resolve_dir(parts[:-1], path)
+        name = parts[-1]
+        return parent, name, parent.lookup(name)
+
+    def _lookup_inode(self, path: str) -> Inode:
+        parts = self._split(path)
+        if not parts:
+            return self.inode_table.read_inode(1)
+        _, _, num = self._resolve_path(path)
+        if num is None:
+            raise NotFoundError(f"No such file or directory: {path}")
+        return self.inode_table.read_inode(num)
+
+    # ================================================================ txn glue
+    @contextmanager
+    def _txn(self, op: str, path: str = ""):
+        self._require_mounted()
+        try:
+            with TransactionContext(self.tx_manager):
+                yield
+        except CrashInjectedError:
+            raise
+        except Exception as e:
+            mapped = _map_error(e)
+            self.events.emit("fs_op_failed", f"{op} {path} failed: {mapped}", severity="warning",
+                             op=op, path=path, error=type(mapped).__name__)
+            if mapped is e:
+                raise
+            raise mapped from e
+        else:
+            info = self.tx_manager.last_tx_info or {}
+            self.events.emit("fs_op", f"{op} {path}", op=op, path=path, txid=info.get("txid"))
+
+    @contextmanager
+    def _reading(self):
+        self._require_mounted()
+        try:
+            yield
+        except CrashInjectedError:
+            raise
+        except Exception as e:
+            mapped = _map_error(e)
+            if mapped is e:
+                raise
+            raise mapped from e
+
+    # ============================================================ operations
     def mkdir(self, path: str) -> None:
-        """Create a directory."""
-        parent_dir, name, existing = self._resolve_path(path)
-        
+        with self._reading():
+            parent, name, existing = self._resolve_path(path)
+            validate_name(name)
         if existing:
-            raise AlreadyExistsError(f"Directory exists: {path}")
-        
-        with TransactionContext(self.tx_manager) as tx:
-            # Allocate inode
+            raise AlreadyExistsError(f"Already exists: {path}")
+        with self._txn("mkdir", path):
             inode = self.inode_table.allocate_inode(InodeType.DIRECTORY, 0o755)
-            
-            # Allocate data block for directory
-            blocks = self.block_allocator.allocate(1)
-            if not blocks:
-                raise DiskFullError("No free blocks for directory")
-            
-            # Convert to absolute block number
-            abs_block = self.block_allocator._get_absolute_block(blocks[0])
-            inode.direct[0] = abs_block
+            blk = self.block_allocator.allocate_any(1)[0]
+            absb = self.block_allocator._get_absolute_block(blk)
+            inode.direct[0] = absb
             inode.blocks_allocated = 1
-            inode.size = 2 * 64  # . and .. entries
-            inode._dirty = True
-            
-            # Write inode
+            self.io.write_block(absb, new_directory_block(inode.inode_num, parent.inode.inode_num))
             self.inode_table.write_inode(inode)
-            
-            # Add entry to parent
-            parent_dir.add_entry(name, inode.inode_num, DIR_TYPE_DIR)
-            
-            # Initialize directory block with . and ..
-            block_data = bytearray(4096)
-            dot_entry = DirEntry(inode.inode_num, ".", DIR_TYPE_DIR).to_bytes()
-            dotdot_entry = DirEntry(parent_dir.inode.inode_num, "..", DIR_TYPE_DIR).to_bytes()
-            block_data[0:64] = dot_entry
-            block_data[64:128] = dotdot_entry
-            self.disk.write_block(abs_block, bytes(block_data))
-            
-            # Record metadata changes in transaction
-            self.tx_manager.add_full_block_change(abs_block, bytes(block_data))
-            # Parent directory block changes handled by Directory.add_entry
-            
-        # Commit happens automatically via context manager
-    
+            parent.add_entry(name, inode.inode_num, DIR_TYPE_DIR)
+            parent.inode.link_count += 1            # the new '..'
+            self.inode_table.write_inode(parent.inode)
+
     def create(self, path: str) -> None:
-        """Create an empty file."""
-        parent_dir, name, existing = self._resolve_path(path)
-        
+        with self._reading():
+            parent, name, existing = self._resolve_path(path)
+            validate_name(name)
         if existing:
-            raise AlreadyExistsError(f"File exists: {path}")
-        
-        with TransactionContext(self.tx_manager) as tx:
-            # Allocate inode
+            raise AlreadyExistsError(f"Already exists: {path}")
+        with self._txn("create", path):
             inode = self.inode_table.allocate_inode(InodeType.FILE, 0o644)
-            
-            # Write inode
-            self.inode_table.write_inode(inode)
-            
-            # Add entry to parent
-            parent_dir.add_entry(name, inode.inode_num, DIR_TYPE_FILE)
-    
+            parent.add_entry(name, inode.inode_num, DIR_TYPE_FILE)
+
+    def _set_file_data(self, inode: Inode, data: bytes) -> None:
+        """Copy-on-write replacement of a file's contents (inside a transaction)."""
+        n = (len(data) + 4095) // 4096
+        old = inode.get_all_blocks()
+        new_abs: List[int] = []
+        if n:
+            new_abs = [self.block_allocator._get_absolute_block(b)
+                       for b in self.block_allocator.allocate_any(n)]
+            for i, b in enumerate(new_abs):
+                chunk = data[i * 4096:(i + 1) * 4096]
+                self.tx_manager.write_data_block(b, chunk + b"\x00" * (4096 - len(chunk)))
+        if old:
+            self.block_allocator.free_absolute(old)
+        inode.direct = new_abs + [0] * (DIRECT_POINTERS - len(new_abs))
+        inode.blocks_allocated = n
+        inode.size = len(data)
+        inode.update_timestamps(mtime=True, ctime=True)
+        self.inode_table.write_inode(inode)
+
+    def _file_for_write(self, path: str, data_len: int) -> Inode:
+        with self._reading():
+            _, _, num = self._resolve_path(path)
+            if num is None:
+                raise NotFoundError(f"File not found: {path}")
+            inode = self.inode_table.read_inode(num)
+        if inode.is_directory:
+            raise IsDirectoryError(f"Is a directory: {path}")
+        if data_len > MAX_FILE_SIZE:
+            raise FileTooLargeError(
+                f"File would be {data_len} bytes; the maximum is {MAX_FILE_SIZE} "
+                f"({DIRECT_POINTERS} direct blocks, no indirect blocks)")
+        return inode
+
     def write(self, path: str, data: bytes) -> int:
-        """Write data to file (replaces content)."""
-        _, _, inode_num = self._resolve_path(path)
-        
-        if inode_num is None:
-            raise NotFoundError(f"File not found: {path}")
-        
-        inode = self.inode_table.read_inode(inode_num)
-        if inode.is_directory:
-            raise IsDirectoryError(f"Is a directory: {path}")
-        
-        # Calculate blocks needed
-        data_len = len(data)
-        blocks_needed = (data_len + 4095) // 4096
-        
-        with TransactionContext(self.tx_manager) as tx:
-            # Free old blocks
-            old_blocks = inode.get_all_blocks()
-            if old_blocks:
-                self.block_allocator.free(old_blocks)
-                inode.direct = [0] * DIRECT_POINTERS
-                inode.blocks_allocated = 0
-            
-            # Allocate new blocks
-            if blocks_needed > 0:
-                new_blocks = self.block_allocator.allocate(blocks_needed)
-                if len(new_blocks) < blocks_needed:
-                    raise DiskFullError("Not enough free blocks")
-                
-                # Convert to absolute block numbers
-                abs_blocks = [self.block_allocator._get_absolute_block(b) for b in new_blocks]
-                inode.direct[:blocks_needed] = abs_blocks
-                inode.blocks_allocated = blocks_needed
-            
-            inode.size = data_len
-            inode.update_timestamps(mtime=True, ctime=True)
-            inode._dirty = True
-            
-            # Write inode
-            self.inode_table.write_inode(inode)
-            inode_block = self.superblock.inode_table_start_block + (inode_num - 1) // 16
-            inode_offset = ((inode_num - 1) % 16) * 256
-            self.tx_manager.add_metadata_change(inode_block, inode_offset, inode.to_bytes())
-            
-            # Write data blocks
-            for i, block_num in enumerate(inode.get_all_blocks()):
-                offset = i * 4096
-                block_data = data[offset:offset + 4096]
-                if len(block_data) < 4096:
-                    block_data += b'\x00' * (4096 - len(block_data))
-                
-                self.disk.write_block(block_num, block_data)
-                self.tx_manager.add_full_block_change(block_num, block_data)
-        
-        return data_len
-    
-    def append(self, path: str, data: bytes) -> int:
-        """Append data to file."""
-        _, _, inode_num = self._resolve_path(path)
-        
-        if inode_num is None:
-            raise NotFoundError(f"File not found: {path}")
-        
-        inode = self.inode_table.read_inode(inode_num)
-        if inode.is_directory:
-            raise IsDirectoryError(f"Is a directory: {path}")
-        
-        current_size = inode.size
-        new_size = current_size + len(data)
-        current_blocks = inode.blocks_allocated
-        new_blocks_needed = (new_size + 4095) // 4096 - current_blocks
-        
-        with TransactionContext(self.tx_manager) as tx:
-            # Allocate additional blocks if needed
-            if new_blocks_needed > 0:
-                new_blocks = self.block_allocator.allocate(new_blocks_needed)
-                if len(new_blocks) < new_blocks_needed:
-                    raise DiskFullError("Not enough free blocks")
-                
-                # Convert to absolute block numbers and add to inode
-                abs_blocks = [self.block_allocator._get_absolute_block(b) for b in new_blocks]
-                idx = 0
-                for i in range(DIRECT_POINTERS):
-                    if inode.direct[i] == 0 and idx < len(abs_blocks):
-                        inode.direct[i] = abs_blocks[idx]
-                        idx += 1
-                
-                inode.blocks_allocated += new_blocks_needed
-            
-            inode.size = new_size
-            inode.update_timestamps(mtime=True, ctime=True)
-            inode._dirty = True
-            
-            # Write inode
-            self.inode_table.write_inode(inode)
-            inode_block = self.superblock.inode_table_start_block + (inode_num - 1) // 16
-            inode_offset = ((inode_num - 1) % 16) * 256
-            self.tx_manager.add_metadata_change(inode_block, inode_offset, inode.to_bytes())
-            
-            # Write new data to the appropriate blocks
-            write_offset = current_size
-            remaining = data
-            while remaining:
-                block_idx = write_offset // 4096
-                block_offset = write_offset % 4096
-                block_num = inode.direct[block_idx]
-                
-                # Read existing block
-                block_data = bytearray(self.disk.read_block(block_num))
-                
-                # Write as much as fits in this block
-                chunk_size = min(len(remaining), 4096 - block_offset)
-                block_data[block_offset:block_offset + chunk_size] = remaining[:chunk_size]
-                
-                # Write back
-                self.disk.write_block(block_num, bytes(block_data))
-                self.tx_manager.add_full_block_change(block_num, bytes(block_data))
-                
-                remaining = remaining[chunk_size:]
-                write_offset += chunk_size
-        
+        inode = self._file_for_write(path, len(data))
+        with self._txn("write", path):
+            self._set_file_data(inode, bytes(data))
         return len(data)
-    
+
+    def append(self, path: str, data: bytes) -> int:
+        with self._reading():
+            current = self.read(path)
+        inode = self._file_for_write(path, len(current) + len(data))
+        with self._txn("append", path):
+            self._set_file_data(inode, current + bytes(data))
+        return len(data)
+
     def read(self, path: str) -> bytes:
-        """Read file contents."""
-        _, _, inode_num = self._resolve_path(path)
-        
-        if inode_num is None:
-            raise NotFoundError(f"File not found: {path}")
-        
-        inode = self.inode_table.read_inode(inode_num)
-        if inode.is_directory:
-            raise IsDirectoryError(f"Is a directory: {path}")
-        
-        if inode.size == 0:
-            return b''
-        
-        data = bytearray()
-        for block_num in inode.get_all_blocks():
-            block_data = self.disk.read_block(block_num)
-            data.extend(block_data)
-        
-        return bytes(data[:inode.size])
-    
+        with self._reading():
+            inode = self._lookup_inode(path)
+            if inode.is_directory:
+                raise IsDirectoryError(f"Is a directory: {path}")
+            out = bytearray()
+            for b in inode.get_all_blocks():
+                out.extend(self.io.read_block(b))
+            return bytes(out[:inode.size])
+
     def ls(self, path: str = "/") -> List[DirEntry]:
-        """List directory contents."""
-        if path == "/":
-            return self.root_dir.list_entries()
-        
-        _, _, inode_num = self._resolve_path(path)
-        
-        if inode_num is None:
-            raise NotFoundError(f"Directory not found: {path}")
-        
-        inode = self.inode_table.read_inode(inode_num)
-        if not inode.is_directory:
-            raise NotDirectoryError(f"Not a directory: {path}")
-        
-        dir_obj = Directory(inode, self.inode_table, self.block_allocator, self.disk)
-        return dir_obj.list_entries()
-    
+        with self._reading():
+            inode = self._lookup_inode(path)
+            if not inode.is_directory:
+                raise NotDirectoryError(f"Not a directory: {path}")
+            return self._dir(inode.inode_num).list_entries()
+
     def stat(self, path: str) -> dict:
-        """Get file/directory metadata."""
-        if path == "/":
-            inode = self.inode_table.read_inode(1)
-        else:
-            _, _, inode_num = self._resolve_path(path)
-            if inode_num is None:
-                raise NotFoundError(f"Path not found: {path}")
-            inode = self.inode_table.read_inode(inode_num)
-        
+        with self._reading():
+            inode = self._lookup_inode(path)
+            return self._inode_dict(inode)
+
+    @staticmethod
+    def _inode_dict(inode: Inode) -> dict:
         return {
-            'inode': inode.inode_num,
-            'type': inode.type.name,
-            'mode': oct(inode.mode),
-            'size': inode.size,
-            'blocks': inode.blocks_allocated,
-            'links': inode.link_count,
-            'ctime': inode.ctime,
-            'mtime': inode.mtime,
-            'atime': inode.atime,
-            'block_pointers': [b for b in inode.direct if b != 0],
+            "inode": inode.inode_num, "type": inode.type.name, "mode": oct(inode.mode),
+            "size": inode.size, "blocks": inode.blocks_allocated, "links": inode.link_count,
+            "ctime": inode.ctime, "mtime": inode.mtime, "atime": inode.atime,
+            "generation": inode.generation,
+            "block_pointers": [b for b in inode.direct if b != 0],
         }
-    
+
     def rename(self, old_path: str, new_path: str) -> None:
-        """Rename/move file or directory."""
-        old_parent, old_name, old_inode_num = self._resolve_path(old_path)
-        if old_inode_num is None:
-            raise NotFoundError(f"Source not found: {old_path}")
-        
-        new_parent, new_name, new_inode_num = self._resolve_path(new_path)
-        if new_inode_num is not None:
+        with self._reading():
+            old_parent, old_name, old_num = self._resolve_path(old_path)
+            if old_num is None:
+                raise NotFoundError(f"Source not found: {old_path}")
+            new_parent, new_name, new_num = self._resolve_path(new_path)
+            validate_name(new_name)
+            src = self.inode_table.read_inode(old_num)
+        if new_num is not None:
             raise AlreadyExistsError(f"Destination exists: {new_path}")
-        
-        if old_parent.inode.inode_num == new_parent.inode.inode_num:
-            # Same directory - simple rename
-            with TransactionContext(self.tx_manager):
+        oparts, nparts = self._split(old_path), self._split(new_path)
+        if src.is_directory and nparts[:len(oparts)] == oparts:
+            raise PathError("cannot move a directory into itself")
+        with self._txn("rename", f"{old_path} -> {new_path}"):
+            if old_parent.inode.inode_num == new_parent.inode.inode_num:
                 old_parent.rename_entry(old_name, new_name)
-        else:
-            # Cross-directory move
-            with TransactionContext(self.tx_manager):
-                # Get entry info
-                entry = old_parent.get_entry(old_name)
-                if entry is None:
-                    raise NotFoundError(f"Entry not found: {old_name}")
-                
-                # Add to new parent
-                new_parent.add_entry(new_name, entry.inode_num, entry.file_type)
-                
-                # Remove from old parent
+            else:
+                ftype = DIR_TYPE_DIR if src.is_directory else DIR_TYPE_FILE
+                new_parent.add_entry(new_name, old_num, ftype)
                 old_parent.remove_entry(old_name)
-                
-                # Update link counts if directory
-                if entry.file_type == DIR_TYPE_DIR:
-                    # Update .. entry in moved directory
-                    target_inode = self.inode_table.read_inode(entry.inode_num)
-                    target_dir = Directory(target_inode, self.inode_table, self.block_allocator, self.disk)
-                    # Update .. entry to point to new parent
-                    # This requires rewriting the directory block
-                    pass
-    
+                if src.is_directory:
+                    self._dir(old_num).set_parent(new_parent.inode.inode_num)
+                    old_parent.inode.link_count -= 1
+                    new_parent.inode.link_count += 1
+                    self.inode_table.write_inode(old_parent.inode)
+                    self.inode_table.write_inode(new_parent.inode)
+
     def delete(self, path: str) -> None:
-        """Delete a file."""
-        parent_dir, name, inode_num = self._resolve_path(path)
-        
-        if inode_num is None:
-            raise NotFoundError(f"File not found: {path}")
-        
-        inode = self.inode_table.read_inode(inode_num)
+        with self._reading():
+            parent, name, num = self._resolve_path(path)
+            if num is None:
+                raise NotFoundError(f"File not found: {path}")
+            inode = self.inode_table.read_inode(num)
         if inode.is_directory:
             raise IsDirectoryError(f"Is a directory, use rmdir: {path}")
-        
-        with TransactionContext(self.tx_manager) as tx:
-            # Free data blocks
+        with self._txn("delete", path):
             blocks = inode.get_all_blocks()
             if blocks:
                 self.block_allocator.free_absolute(blocks)
-            
-            # Free inode
             inode.link_count -= 1
             if inode.link_count <= 0:
-                self.inode_table.free_inode(inode_num)
+                inode.link_count = 0
+                self.inode_table.write_inode(inode)
+                self.inode_table.free_inode(inode.inode_num)
             else:
                 self.inode_table.write_inode(inode)
-            
-            # Remove directory entry
-            parent_dir.remove_entry(name)
-    
+            parent.remove_entry(name)
+
     def rmdir(self, path: str) -> None:
-        """Remove an empty directory."""
-        parent_dir, name, inode_num = self._resolve_path(path)
-        
-        if inode_num is None:
-            raise NotFoundError(f"Directory not found: {path}")
-        
-        inode = self.inode_table.read_inode(inode_num)
-        if not inode.is_directory:
-            raise NotDirectoryError(f"Not a directory: {path}")
-        
-        dir_obj = Directory(inode, self.inode_table, self.block_allocator, self.disk)
-        if not dir_obj.is_empty():
-            raise DirectoryNotEmptyError(f"Directory not empty: {path}")
-        
-        with TransactionContext(self.tx_manager) as tx:
-            # Free directory block
+        with self._reading():
+            parent, name, num = self._resolve_path(path)
+            if num is None:
+                raise NotFoundError(f"Directory not found: {path}")
+            inode = self.inode_table.read_inode(num)
+            if not inode.is_directory:
+                raise NotDirectoryError(f"Not a directory: {path}")
+            if not self._dir(num).is_empty():
+                raise DirectoryNotEmptyError(f"Directory not empty: {path}")
+        with self._txn("rmdir", path):
             blocks = inode.get_all_blocks()
             if blocks:
                 self.block_allocator.free_absolute(blocks)
-            
-            # Free inode (set link_count=0 first)
             inode.link_count = 0
             self.inode_table.write_inode(inode)
-            self.inode_table.free_inode(inode_num)
-            
-            # Remove directory entry
-            parent_dir.remove_entry(name)
-    
+            self.inode_table.free_inode(inode.inode_num)
+            parent.remove_entry(name)
+            parent.inode.link_count -= 1
+            self.inode_table.write_inode(parent.inode)
+
+    # ============================================================ reporting
     def df(self) -> dict:
-        """Get disk usage statistics."""
+        sb = self.superblock
+        used = sb.total_blocks - sb.free_block_count
         return {
-            'total_blocks': self.superblock.total_blocks,
-            'total_size': self.superblock.total_blocks * self.superblock.block_size,
-            'free_blocks': self.superblock.free_block_count,
-            'free_size': self.superblock.free_block_count * self.superblock.block_size,
-            'used_blocks': self.superblock.total_blocks - self.superblock.free_block_count,
-            'used_size': (self.superblock.total_blocks - self.superblock.free_block_count) * self.superblock.block_size,
-            'total_inodes': self.superblock.total_inodes,
-            'free_inodes': self.superblock.free_inode_count,
-            'used_inodes': self.superblock.total_inodes - self.superblock.free_inode_count,
+            "total_blocks": sb.total_blocks, "total_size": sb.total_blocks * sb.block_size,
+            "free_blocks": sb.free_block_count, "free_size": sb.free_block_count * sb.block_size,
+            "used_blocks": used, "used_size": used * sb.block_size,
+            "data_blocks": sb.data_block_count,
+            "data_used": sb.data_block_count - sb.free_block_count,
+            "total_inodes": sb.total_inodes, "free_inodes": sb.free_inode_count,
+            "used_inodes": sb.total_inodes - sb.free_inode_count,
         }
-    
+
     def dump(self) -> dict:
-        """Dump filesystem state for debugging."""
+        sb = self.superblock
         return {
-            'superblock': {
-                'magic': hex(self.superblock.magic),
-                'version': self.superblock.version,
-                'total_blocks': self.superblock.total_blocks,
-                'journal_blocks': self.superblock.journal_block_count,
-                'bitmap_blocks': self.superblock.bitmap_block_count,
-                'inode_blocks': self.superblock.inode_table_block_count,
-                'data_blocks': self.superblock.data_block_count,
-                'journal_head': self.superblock.journal_head,
-                'journal_tail': self.superblock.journal_tail,
-                'checkpoint_txid': self.superblock.checkpoint_txid,
+            "superblock": {
+                "magic": hex(sb.magic), "version": sb.version, "total_blocks": sb.total_blocks,
+                "journal_blocks": sb.journal_block_count, "bitmap_blocks": sb.bitmap_block_count,
+                "inode_blocks": sb.inode_table_block_count, "data_blocks": sb.data_block_count,
+                "journal_head": sb.journal_head, "journal_tail": sb.journal_tail,
+                "checkpoint_txid": sb.checkpoint_txid,
             },
-            'journal': self.journal.get_journal_stats(),
-            'bitmap': self.block_allocator.get_bitmap_summary(),
-            'inodes': self.inode_table.get_stats(),
-            'df': self.df(),
+            "journal": self.journal.get_journal_stats(),
+            "bitmap": self.block_allocator.get_bitmap_summary(),
+            "inodes": self.inode_table.get_stats(),
+            "df": self.df(),
         }
-    
+
     def check(self) -> List[str]:
-        """Run consistency check."""
-        return self.checker.check_all()
-    
-    def recover(self) -> None:
-        """Explicitly run recovery."""
+        self._require_mounted()
+        return self.check_report().errors
+
+    def check_report(self) -> CheckResult:
+        self._require_mounted()
+        res = self.checker.check_and_report()
+        self.last_check = {"at": time.time(), **res.to_dict()}
+        self.events.emit("check_result",
+                         f"consistency check {'PASSED' if res.passed else 'FAILED'}: "
+                         f"{len(res.errors)} error(s), {len(res.warnings)} warning(s)",
+                         severity="info" if res.passed else "error",
+                         errors=len(res.errors), warnings=len(res.warnings))
+        return res
+
+    def recover(self) -> RecoveryResult:
+        self._require_mounted()
         result = self.recovery_mgr.recover()
+        self.last_recovery = result
         if not result.success:
             raise FileSystemError(f"Recovery failed: {result.errors}")
+        self.tx_manager.read_only = False
+        return result
+
+    def checkpoint(self) -> None:
+        """Force a checkpoint (reclaim journal space)."""
+        self._require_mounted()
+        if self.journal.uncheckpointed:
+            self.journal.checkpoint()
+
+    # ======================================================= introspection
+    def layout(self) -> List[Dict[str, Any]]:
+        """Disk regions with real offsets and usage (all values read from the superblock/bitmap)."""
+        sb = self.superblock
+        bs = sb.block_size
+        j = self.journal
+        used_inodes = sb.total_inodes - sb.free_inode_count
+
+        def region(name, start, count, used=None, note=""):
+            return {"name": name, "start_block": start, "block_count": count,
+                    "end_block": start + count - 1, "offset_bytes": start * bs,
+                    "size_bytes": count * bs, "used_blocks": used, "note": note}
+
+        return [
+            region("superblock", 0, 1, 1, "format metadata, counters, journal tail & checkpoint txid"),
+            region("journal", sb.journal_start_block, sb.journal_block_count, j.used_blocks(),
+                   "circular redo log; 'used' = blocks between tail and head (live, un-checkpointed)"),
+            region("bitmap", sb.bitmap_start_block, sb.bitmap_block_count, sb.bitmap_block_count,
+                   "1 bit per data block"),
+            region("inode table", sb.inode_table_start_block, sb.inode_table_block_count,
+                   (used_inodes + INODES_PER_BLOCK - 1) // INODES_PER_BLOCK,
+                   f"{used_inodes}/{sb.total_inodes} inodes in use, {INODES_PER_BLOCK} per block"),
+            region("data", sb.data_start_block, sb.data_block_count,
+                   sb.data_block_count - sb.free_block_count,
+                   "file contents and directory blocks"),
+        ]
+
+    def _region_of(self, n: int) -> str:
+        sb = self.superblock
+        if n == 0:
+            return "superblock"
+        if sb.journal_start_block <= n < sb.journal_start_block + sb.journal_block_count:
+            return "journal"
+        if sb.bitmap_start_block <= n < sb.bitmap_start_block + sb.bitmap_block_count:
+            return "bitmap"
+        if sb.inode_table_start_block <= n < sb.inode_table_start_block + sb.inode_table_block_count:
+            return "inode table"
+        if sb.data_start_block <= n < sb.data_start_block + sb.data_block_count:
+            return "data"
+        return "outside"
+
+    def read_raw_block(self, n: int) -> bytes:
+        self._require_mounted()
+        return self.disk.read_block(n)
+
+    def inode_info(self, n: int) -> Dict[str, Any]:
+        self._require_mounted()
+        inode = self.inode_table.read_inode(n)
+        blk, off = self.inode_table._get_inode_location(n)
+        d = self._inode_dict(inode)
+        d.update({"in_use": not inode.is_free, "location": {"block": blk, "offset": off, "size": INODE_SIZE},
+                  "uid": inode.uid, "gid": inode.gid, "flags": inode.flags,
+                  "indirect": [inode.indirect1, inode.indirect2, inode.indirect3]})
+        return d
+
+    def block_info(self, n: int) -> Dict[str, Any]:
+        self._require_mounted()
+        sb = self.superblock
+        if n < 0 or n >= sb.total_blocks:
+            raise PathError(f"block {n} out of range [0, {sb.total_blocks})")
+        raw = self.disk.read_block(n)
+        region = self._region_of(n)
+        info: Dict[str, Any] = {"block": n, "region": region, "offset_bytes": n * sb.block_size,
+                                "all_zero": not any(raw), "decoded": None, "decoded_kind": None}
+        if region == "superblock":
+            s = Superblock.from_bytes(raw)
+            info["decoded_kind"] = "superblock"
+            info["decoded"] = {k: (v.decode(errors="replace") if isinstance(v, bytes) else v)
+                               for k, v in s.__dict__.items() if not k.startswith("_") and k != "reserved"}
+            info["decoded"]["checksum_ok"] = s.verify_checksum()
+        elif region == "inode table":
+            base = (n - sb.inode_table_start_block) * INODES_PER_BLOCK + 1
+            ins = []
+            for i in range(INODES_PER_BLOCK):
+                try:
+                    ino = Inode.from_bytes(raw[i * INODE_SIZE:(i + 1) * INODE_SIZE], base + i)
+                except ValueError:
+                    ins.append({"inode": base + i, "type": "CORRUPT"})
+                    continue
+                ins.append({"inode": base + i, "type": ino.type.name, "size": ino.size,
+                            "links": ino.link_count, "blocks": [b for b in ino.direct if b]})
+            info["decoded_kind"] = "inodes"
+            info["decoded"] = ins
+        elif region == "bitmap":
+            bits = sum(bin(b).count("1") for b in raw)
+            info["decoded_kind"] = "bitmap"
+            info["decoded"] = {"bits_set": bits, "bits_per_block": 4096 * 8}
+        elif region == "journal":
+            rel = n - sb.journal_start_block
+            info["decoded_kind"] = "journal"
+            txs = [t for t in self.journal.scan_region()
+                   if rel in [(t["start_block"] + i) % sb.journal_block_count for i in range(t["blocks"])]]
+            info["decoded"] = {"journal_block": rel, "transactions": txs,
+                               "is_live": self._journal_block_live(rel)}
+        elif region == "data":
+            owner = None
+            for ino in self.inode_table.iter_inodes():
+                if n in ino.get_all_blocks():
+                    owner = ino
+                    break
+            info["owner_inode"] = owner.inode_num if owner else None
+            allocated = self.block_allocator.is_allocated_absolute(n)
+            info["allocated"] = allocated
+            if owner is not None and owner.is_directory:
+                info["decoded_kind"] = "directory"
+                ents = []
+                for i in range(4096 // DIR_ENTRY_SIZE):
+                    try:
+                        e = DirEntry.from_bytes(raw[i * DIR_ENTRY_SIZE:(i + 1) * DIR_ENTRY_SIZE])
+                    except Exception:
+                        ents.append({"slot": i, "error": "corrupt"})
+                        continue
+                    if not e.is_empty:
+                        ents.append({"slot": i, "inode": e.inode_num, "name": e.name, "type": e.file_type})
+                info["decoded"] = ents
+            elif owner is not None:
+                info["decoded_kind"] = "file-data"
+                chunk = raw[:max(0, min(4096, owner.size - owner.get_all_blocks().index(n) * 4096))]
+                info["decoded"] = {"text_preview": chunk[:256].decode("utf-8", errors="replace")}
+        return info
+
+    def _journal_block_live(self, rel: int) -> bool:
+        j = self.journal
+        used = j.used_blocks()
+        return ((rel - j.tail) % j.journal_blocks) < used
+
+    def journal_view(self) -> Dict[str, Any]:
+        self._require_mounted()
+        return {"stats": self.journal.get_journal_stats(), "transactions": self.journal.scan_region()}
+
+    def overview(self) -> Dict[str, Any]:
+        self._require_mounted()
+        sb = self.superblock
+        d = self.df()
+        txs = self.journal.scan_region()
+        latest = txs[-1] if txs else None
+        js = self.journal.get_journal_stats()
+        rec = self.last_recovery
+        return {
+            "mounted": True, "read_only": self.tx_manager.read_only,
+            "image": self.disk_path, "volume_label": sb.volume_label.decode(errors="replace"),
+            "disk_size": self.disk.disk_size, "block_size": sb.block_size, "cache_mode": self.cache_mode,
+            "checkpoint_policy": self.tx_manager.checkpoint_policy,
+            "blocks": {"total": sb.total_blocks, "data_total": sb.data_block_count,
+                       "data_used": d["data_used"], "data_free": sb.free_block_count},
+            "inodes": {"total": sb.total_inodes, "used": d["used_inodes"], "free": sb.free_inode_count},
+            "journal": {"capacity_blocks": sb.journal_block_count, "used_blocks": js["used_blocks"],
+                        "head": js["head"], "tail": js["tail"], "checkpoint_txid": js["checkpoint_txid"],
+                        "pending_tx": js["uncheckpointed"]},
+            "latest_tx": ({"txid": latest["txid"], "state": latest["state"]} if latest else None),
+            "recovery": (None if rec is None else
+                         {"success": rec.success, "replayed": rec.transactions_replayed,
+                          "discarded": rec.transactions_discarded, "warnings": rec.warnings}),
+            "last_check": (None if not self.last_check else
+                           {"at": self.last_check["at"], "passed": self.last_check["passed"],
+                            "errors": len(self.last_check["errors"]),
+                            "warnings": len(self.last_check["warnings"])}),
+            "io": dict(self.disk.stats),
+        }
+
+    def tree(self, path: str = "/", depth: int = 8) -> Dict[str, Any]:
+        """Recursive listing for the UI file browser."""
+        self._require_mounted()
+        inode = self._lookup_inode(path)
+        node = {"name": path.rstrip("/").split("/")[-1] or "/", "path": path or "/",
+                "inode": inode.inode_num, "type": inode.type.name, "size": inode.size}
+        if inode.is_directory and depth > 0:
+            node["children"] = []
+            for e in self._dir(inode.inode_num).list_entries():
+                child = path.rstrip("/") + "/" + e.name
+                node["children"].append(self.tree(child, depth - 1))
+        return node
 
 
-def create_filesystem(disk_path: str, **format_args) -> FileSystem:
-    """Create and format a new filesystem."""
-    fs = FileSystem(disk_path)
+def create_filesystem(disk_path: str, cache_mode: str = "volatile", checkpoint: str = "eager",
+                      **format_args) -> FileSystem:
+    fs = FileSystem(disk_path, cache_mode=cache_mode, checkpoint=checkpoint)
     fs.format(**format_args)
     return fs
 
 
-def open_filesystem(disk_path: str, run_recovery: bool = True) -> FileSystem:
-    """Open an existing filesystem."""
-    fs = FileSystem(disk_path)
+def open_filesystem(disk_path: str, run_recovery: bool = True, cache_mode: str = "volatile",
+                    checkpoint: str = "eager") -> FileSystem:
+    fs = FileSystem(disk_path, cache_mode=cache_mode, checkpoint=checkpoint)
     fs.mount(run_recovery=run_recovery)
     return fs

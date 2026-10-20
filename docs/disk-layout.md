@@ -96,13 +96,28 @@ Offset  Size  Field
 16      N     After-image data (length bytes)
 ```
 
-#### TRANS_COMMIT Payload (8 bytes)
+#### TRANS_COMMIT Payload (12 bytes; 8-byte legacy form still accepted)
 
 ```
 Offset  Size  Field
 ------  ----  -----
 0       8     Transaction ID (uint64)
+8       4     Number of TRANS_DATA records in this transaction (uint32)
 ```
+
+The record count lets recovery reject a commit whose data records are missing or torn.
+
+#### Journal placement rules (v2 engine, format version unchanged)
+
+* A transaction starts on a **block boundary**: `BEGIN`, then the `DATA` records packed back to back
+  (a record may span block boundaries inside the ring).
+* The `COMMIT` record is written **alone in the next block**, so that a torn write can only damage the
+  commit record itself (its CRC then fails and the transaction is discarded).
+* The ring is circular: positions wrap modulo the journal block count. A transaction is accepted only
+  if its txid equals `checkpoint_txid + 1 + (number already accepted)`; stale blocks from earlier
+  laps therefore never replay. `journal_head` in the superblock is advisory; recovery does not trust it.
+* The legacy `CHECKPOINT` record type is still decodable but no longer written; the superblock is the
+  checkpoint.
 
 #### CHECKPOINT Payload (24 bytes)
 
@@ -138,10 +153,11 @@ Offset  Size  Field
 36      8     Modified time (uint64)
 44      8     Accessed time (uint64)
 52      8     Change time (uint64)
-60      12    Direct block pointers (12 × uint64 = 96 bytes)
+60      96    Direct block pointers (12 × uint64)
 156     8     Singly indirect block pointer (uint64)
 164     8     Doubly indirect block pointer (uint64)
 172     8     Triply indirect block pointer (uint64)
+                     (the three indirect pointers are reserved and unused: maximum file size is 12 blocks = 48 KiB)
 180     4     Link count (uint32)
 184     4     Flags (uint32)
 188     8     Generation number (uint64)
@@ -167,7 +183,8 @@ Offset  Size  Field
 12      52    Name (bytes, null-terminated, max 51 chars)
 ```
 
-Directory entries are packed sequentially in directory blocks. Empty entries have inode=0.
+Directory entries are packed sequentially in directory blocks. Empty entries have inode=0. A directory
+may own at most 12 blocks (768 entries). `.` and `..` are stored as normal entries.
 
 ## Checksum Algorithm
 

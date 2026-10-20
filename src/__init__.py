@@ -15,10 +15,12 @@ from .transaction import TransactionManager, TransactionContext, TransactionErro
 from .recovery import RecoveryManager, RecoveryResult, run_recovery
 from .consistency_checker import ConsistencyChecker, CheckResult, run_consistency_check
 from .crash_injector import CrashInjector, CrashMode, CrashScenario, CrashInjectedError
-from .filesystem import FileSystem, create_filesystem, open_filesystem, FileSystemError, DirectoryNotEmptyError
-from .cli import CLI, main
+from .filesystem import (FileSystem, create_filesystem, open_filesystem, FileSystemError, DirectoryNotEmptyError,
+                         DiskFullError, FileTooLargeError, MountError, PathError, NotFoundError, AlreadyExistsError)
+from .events import EventLog
+from .transaction import StagingIO, ReadOnlyError
 
-__version__ = "1.0.0"
+__version__ = "2.0.0"
 __author__ = "OS Course Project"
 
 __all__ = [
@@ -44,7 +46,7 @@ __all__ = [
     # Crash injector
     "CrashInjector", "CrashMode", "CrashScenario", "CrashInjectedError",
     # Filesystem
-    "FileSystem", "create_filesystem", "open_filesystem", "FileSystemError",
-    # CLI
-    "CLI", "main",
+    "FileSystem", "create_filesystem", "open_filesystem", "FileSystemError", "DiskFullError",
+    "FileTooLargeError", "MountError", "PathError", "NotFoundError", "AlreadyExistsError", "EventLog",
+    "StagingIO", "ReadOnlyError",
 ]

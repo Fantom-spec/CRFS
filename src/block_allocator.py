@@ -1,302 +1,215 @@
 """
 Block Allocator Module
 
-Manages the free-space bitmap for data block allocation.
+Free-space bitmap for data blocks (1 bit per data block, 0 = free).
+
+The bitmap is always read from and written through the block I/O object it
+was given (the transaction-staging proxy in a mounted filesystem), and it is
+never cached in memory, so an aborted transaction cannot leave stale
+allocation state behind.  Free-block accounting lives in the superblock
+(which the transaction layer snapshots/restores on abort).
 """
 
-import struct
-from typing import List, Optional, Iterator
-from .virtual_disk import VirtualDisk
+from typing import Iterator, List, Optional, Set, Tuple
+
 from .superblock import Superblock
 
 
 class BlockAllocatorError(Exception):
-    """Base exception for block allocator errors."""
     pass
 
 
 class NoFreeBlocksError(BlockAllocatorError):
-    """Raised when no free blocks are available."""
     pass
 
 
 class InvalidBlockError(BlockAllocatorError):
-    """Raised when block number is invalid."""
     pass
 
 
 class BlockAllocator:
-    """
-    Manages free-space bitmap for data block allocation.
-    
-    Bitmap is stored in dedicated blocks, 1 bit per data block.
-    0 = free, 1 = allocated.
-    """
-    
-    BITS_PER_BLOCK = 4096 * 8  # 32768 bits per 4KiB block
-    
-    def __init__(self, disk: VirtualDisk, superblock: Superblock):
-        self.disk = disk
+    BITS_PER_BLOCK = 4096 * 8
+
+    def __init__(self, disk, superblock: Superblock):
+        self.disk = disk          # raw disk or StagingIO
         self.superblock = superblock
-        self._bitmap: Optional[bytearray] = None
-        self._dirty = False
-    
-    def _load_bitmap(self) -> None:
-        """Load bitmap from disk into memory."""
-        if self._bitmap is not None:
-            return
-        
+        # blocks freed in the running transaction must not be re-allocated by it
+        self.avoid: Set[int] = set()
+        # blocks allocated in the running transaction (absolute numbers)
+        self.fresh: Set[int] = set()
+
+    # ------------------------------------------------------------- helpers
+    def _read_bitmap(self) -> bytearray:
         sb = self.superblock
-        bitmap_blocks = sb.bitmap_block_count
-        bitmap_start = sb.bitmap_start_block
-        
-        # Read all bitmap blocks
-        data = self.disk.read_blocks(bitmap_start, bitmap_blocks)
-        self._bitmap = bytearray(data)
-        self._dirty = False
-    
-    def _save_bitmap(self) -> None:
-        """Write bitmap from memory to disk."""
-        if self._bitmap is None or not self._dirty:
-            return
-        
+        return bytearray(self.disk.read_blocks(sb.bitmap_start_block, sb.bitmap_block_count))
+
+    def _write_bitmap(self, bitmap: bytearray, changed_bytes: List[int]) -> None:
+        """Write back only the bitmap blocks that contain a changed byte."""
         sb = self.superblock
-        bitmap_start = sb.bitmap_start_block
-        bitmap_blocks = sb.bitmap_block_count
-        
-        # Ensure we have exactly the right amount of data
-        expected_size = bitmap_blocks * 4096
-        if len(self._bitmap) != expected_size:
-            # Pad or truncate
-            self._bitmap = bytearray(self._bitmap[:expected_size].ljust(expected_size, b'\x00'))
-        
-        self.disk.write_blocks(bitmap_start, bytes(self._bitmap))
-        self._dirty = False
-    
-    def _get_bit_index(self, data_block: int) -> tuple[int, int]:
-        """
-        Convert data block number to (byte_index, bit_mask).
-        
-        Args:
-            data_block: Data block number (relative to data region start)
-            
-        Returns:
-            Tuple of (byte_index, bit_mask)
-        """
+        bs = self.disk.block_size
+        for bi in sorted({i // bs for i in changed_bytes}):
+            self.disk.write_block(sb.bitmap_start_block + bi, bytes(bitmap[bi * bs:(bi + 1) * bs]))
+
+    def _check(self, data_block: int) -> None:
         if data_block < 0 or data_block >= self.superblock.data_block_count:
-            raise InvalidBlockError(f"Data block {data_block} out of range [0, {self.superblock.data_block_count})")
-        
-        byte_index = data_block // 8
-        bit_index = data_block % 8
-        return byte_index, 1 << bit_index
-    
+            raise InvalidBlockError(
+                f"Data block {data_block} out of range [0, {self.superblock.data_block_count})")
+
+    def _get_bit_index(self, data_block: int) -> Tuple[int, int]:
+        self._check(data_block)
+        return data_block // 8, 1 << (data_block % 8)
+
     def _get_absolute_block(self, data_block: int) -> int:
-        """Convert data block index to absolute block number."""
         return self.superblock.data_start_block + data_block
-    
+
     def _get_data_block_index(self, absolute_block: int) -> int:
-        """Convert absolute block number to data block index."""
         return absolute_block - self.superblock.data_start_block
-    
+
+    # -------------------------------------------------------------- queries
     def is_allocated(self, data_block: int) -> bool:
-        """Check if a data block is allocated."""
-        self._load_bitmap()
-        byte_index, bit_mask = self._get_bit_index(data_block)
-        return (self._bitmap[byte_index] & bit_mask) != 0
-    
+        self._check(data_block)
+        bs = self.disk.block_size
+        byte_index, mask = self._get_bit_index(data_block)
+        blk = self.disk.read_block(self.superblock.bitmap_start_block + byte_index // bs)
+        return (blk[byte_index % bs] & mask) != 0
+
     def is_allocated_absolute(self, absolute_block: int) -> bool:
-        """Check if an absolute block is allocated."""
-        data_block = self._get_data_block_index(absolute_block)
-        return self.is_allocated(data_block)
-    
-    def allocate(self, count: int = 1) -> List[int]:
-        """
-        Allocate one or more contiguous free blocks.
-        
-        Args:
-            count: Number of contiguous blocks to allocate
-            
-        Returns:
-            List of allocated data block indices (relative to data region)
-            
-        Raises:
-            NoFreeBlocksError: If insufficient contiguous free blocks
-        """
-        if count <= 0:
-            raise ValueError("Count must be positive")
-        
-        self._load_bitmap()
-        
-        # Search for contiguous free blocks
-        max_block = self.superblock.data_block_count
-        byte_index = 0
-        bit_index = 0
-        current_run = 0
-        start_block = 0
-        
-        for data_block in range(max_block):
-            byte_idx, bit_mask = self._get_bit_index(data_block)
-            allocated = (self._bitmap[byte_idx] & bit_mask) != 0
-            
-            if not allocated:
-                if current_run == 0:
-                    start_block = data_block
-                current_run += 1
-                if current_run >= count:
-                    # Found enough contiguous blocks
-                    allocated_blocks = list(range(start_block, start_block + count))
-                    for blk in allocated_blocks:
-                        b_idx, b_mask = self._get_bit_index(blk)
-                        self._bitmap[b_idx] |= b_mask
-                    
-                    self._dirty = True
-                    self.superblock.free_block_count -= count
-                    self.superblock._dirty = True
-                    return allocated_blocks
-            else:
-                current_run = 0
-        
-        raise NoFreeBlocksError(f"No {count} contiguous free blocks available")
-    
-    def allocate_any(self, count: int = 1) -> List[int]:
-        """
-        Allocate any free blocks (not necessarily contiguous).
-        
-        Args:
-            count: Number of blocks to allocate
-            
-        Returns:
-            List of allocated data block indices
-        """
-        if count <= 0:
-            raise ValueError("Count must be positive")
-        
-        self._load_bitmap()
-        
-        if self.superblock.free_block_count < count:
-            raise NoFreeBlocksError(f"Only {self.superblock.free_block_count} free blocks, need {count}")
-        
-        allocated = []
-        for data_block in range(self.superblock.data_block_count):
-            if len(allocated) >= count:
-                break
-            
-            byte_idx, bit_mask = self._get_bit_index(data_block)
-            if (self._bitmap[byte_idx] & bit_mask) == 0:
-                self._bitmap[byte_idx] |= bit_mask
-                allocated.append(data_block)
-        
-        if len(allocated) < count:
-            raise NoFreeBlocksError("Failed to allocate requested blocks")
-        
-        self._dirty = True
-        self.superblock.free_block_count -= count
+        return self.is_allocated(self._get_data_block_index(absolute_block))
+
+    def get_bitmap_data(self) -> List[Tuple[int, bytes]]:
+        bm = self._read_bitmap()
+        bs = self.disk.block_size
+        sb = self.superblock
+        return [(sb.bitmap_start_block + i, bytes(bm[i * bs:(i + 1) * bs]))
+                for i in range(sb.bitmap_block_count)]
+
+    # ------------------------------------------------------------ allocation
+    def _mark(self, blocks: List[int], bm: bytearray) -> None:
+        changed = []
+        for b in blocks:
+            idx, mask = self._get_bit_index(b)
+            bm[idx] |= mask
+            changed.append(idx)
+        self._write_bitmap(bm, changed)
+        self.superblock.free_block_count -= len(blocks)
         self.superblock._dirty = True
-        return allocated
-    
+        self.fresh.update(self._get_absolute_block(b) for b in blocks)
+
+    def allocate(self, count: int = 1) -> List[int]:
+        """Allocate ``count`` CONTIGUOUS blocks. Returns data-region indices."""
+        if count <= 0:
+            raise ValueError("Count must be positive")
+        bm = self._read_bitmap()
+        run = 0
+        start = 0
+        for b in range(self.superblock.data_block_count):
+            idx, mask = b // 8, 1 << (b % 8)
+            used = (bm[idx] & mask) != 0 or self._get_absolute_block(b) in self.avoid
+            if used:
+                run = 0
+                continue
+            if run == 0:
+                start = b
+            run += 1
+            if run >= count:
+                blocks = list(range(start, start + count))
+                self._mark(blocks, bm)
+                return blocks
+        raise NoFreeBlocksError(f"No {count} contiguous free blocks available")
+
+    def allocate_any(self, count: int = 1) -> List[int]:
+        """Allocate ``count`` free blocks, contiguous or not (all-or-nothing)."""
+        if count <= 0:
+            raise ValueError("Count must be positive")
+        bm = self._read_bitmap()
+        found: List[int] = []
+        for b in range(self.superblock.data_block_count):
+            idx, mask = b // 8, 1 << (b % 8)
+            if (bm[idx] & mask) == 0 and self._get_absolute_block(b) not in self.avoid:
+                found.append(b)
+                if len(found) == count:
+                    self._mark(found, bm)
+                    return found
+        raise NoFreeBlocksError(f"Only {len(found)} free blocks, need {count}")
+
     def free(self, data_blocks: List[int]) -> None:
-        """
-        Free previously allocated blocks.
-        
-        Args:
-            data_blocks: List of data block indices to free
-        """
-        self._load_bitmap()
-        
-        for data_block in data_blocks:
-            byte_idx, bit_mask = self._get_bit_index(data_block)
-            if (self._bitmap[byte_idx] & bit_mask) == 0:
-                raise InvalidBlockError(f"Block {data_block} already free")
-            self._bitmap[byte_idx] &= ~bit_mask
-        
-        self._dirty = True
+        if not data_blocks:
+            return
+        bm = self._read_bitmap()
+        changed = []
+        seen = set()
+        for b in data_blocks:
+            idx, mask = self._get_bit_index(b)
+            if b in seen or (bm[idx] & mask) == 0:
+                raise InvalidBlockError(f"Block {b} already free")
+            seen.add(b)
+            bm[idx] &= ~mask & 0xFF
+            changed.append(idx)
+        self._write_bitmap(bm, changed)
         self.superblock.free_block_count += len(data_blocks)
         self.superblock._dirty = True
-    
+        self.avoid.update(self._get_absolute_block(b) for b in data_blocks)
+
     def free_absolute(self, absolute_blocks: List[int]) -> None:
-        """Free blocks by absolute block numbers."""
-        data_blocks = [self._get_data_block_index(b) for b in absolute_blocks]
-        self.free(data_blocks)
-    
+        self.free([self._get_data_block_index(b) for b in absolute_blocks])
+
+    def stage_free_absolute(self, absolute_blocks: List[int], tx_manager=None) -> None:
+        """Kept for API compatibility; staging is implicit now."""
+        self.free_absolute(absolute_blocks)
+
+    # ------------------------------------------------------------ accounting
     def get_free_count(self) -> int:
-        """Get number of free blocks."""
         return self.superblock.free_block_count
-    
+
     def get_allocated_count(self) -> int:
-        """Get number of allocated blocks."""
         return self.superblock.data_block_count - self.superblock.free_block_count
-    
+
     def iter_allocated(self) -> Iterator[int]:
-        """Iterate over allocated data block indices."""
-        self._load_bitmap()
-        for data_block in range(self.superblock.data_block_count):
-            if self.is_allocated(data_block):
-                yield data_block
-    
+        bm = self._read_bitmap()
+        for b in range(self.superblock.data_block_count):
+            if bm[b // 8] & (1 << (b % 8)):
+                yield b
+
     def iter_free(self) -> Iterator[int]:
-        """Iterate over free data block indices."""
-        self._load_bitmap()
-        for data_block in range(self.superblock.data_block_count):
-            if not self.is_allocated(data_block):
-                yield data_block
-    
+        bm = self._read_bitmap()
+        for b in range(self.superblock.data_block_count):
+            if not bm[b // 8] & (1 << (b % 8)):
+                yield b
+
+    def count_allocated(self) -> int:
+        return sum(1 for _ in self.iter_allocated())
+
     def flush(self) -> None:
-        """Flush bitmap to disk."""
-        self._save_bitmap()
-        # Also flush superblock since free count changed
-        if self.superblock._dirty:
-            self.superblock._checksum = self.superblock.compute_checksum()
-            self.disk.write_block(0, self.superblock.to_bytes())
-            self.superblock._dirty = False
-    
+        """No-op (kept for compatibility): the bitmap is never cached."""
+
     def verify_consistency(self, allocated_by_inodes: set) -> List[str]:
-        """
-        Verify bitmap consistency against inode block references.
-        
-        Args:
-            allocated_by_inodes: Set of absolute block numbers referenced by inodes
-            
-        Returns:
-            List of error messages (empty if consistent)
-        """
         errors = []
-        self._load_bitmap()
-        
-        # Check each data block
-        for data_block in range(self.superblock.data_block_count):
-            absolute_block = self._get_absolute_block(data_block)
-            in_bitmap = self.is_allocated(data_block)
-            in_inodes = absolute_block in allocated_by_inodes
-            
+        alloc = set(self.iter_allocated())
+        for b in range(self.superblock.data_block_count):
+            absolute = self._get_absolute_block(b)
+            in_bitmap = b in alloc
+            in_inodes = absolute in allocated_by_inodes
             if in_bitmap and not in_inodes:
-                errors.append(f"Block {absolute_block} (data index {data_block}) marked allocated in bitmap but not referenced by any inode")
-            elif not in_bitmap and in_inodes:
-                errors.append(f"Block {absolute_block} (data index {data_block}) referenced by inode but marked free in bitmap")
-        
-        # Verify free count matches
-        actual_free = sum(1 for i in range(self.superblock.data_block_count) if not self.is_allocated(i))
-        if actual_free != self.superblock.free_block_count:
-            errors.append(f"Free block count mismatch: bitmap={actual_free}, superblock={self.superblock.free_block_count}")
-        
+                errors.append(f"Block {absolute} allocated in bitmap but not referenced by any inode")
+            elif in_inodes and not in_bitmap:
+                errors.append(f"Block {absolute} referenced by inode but marked free in bitmap")
+        free = self.superblock.data_block_count - len(alloc)
+        if free != self.superblock.free_block_count:
+            errors.append(f"Free block count mismatch: bitmap={free}, superblock={self.superblock.free_block_count}")
         return errors
-    
+
     def get_bitmap_summary(self) -> dict:
-        """Get bitmap statistics."""
-        self._load_bitmap()
-        allocated = sum(1 for i in range(self.superblock.data_block_count) if self.is_allocated(i))
-        free = self.superblock.data_block_count - allocated
+        allocated = self.count_allocated()
         return {
-            'total_blocks': self.superblock.data_block_count,
-            'allocated': allocated,
-            'free': free,
-            'superblock_free_count': self.superblock.free_block_count,
-            'bitmap_blocks': self.superblock.bitmap_block_count,
+            "total_blocks": self.superblock.data_block_count,
+            "allocated": allocated,
+            "free": self.superblock.data_block_count - allocated,
+            "superblock_free_count": self.superblock.free_block_count,
+            "bitmap_blocks": self.superblock.bitmap_block_count,
         }
 
 
-def create_initial_bitmap(disk: VirtualDisk, superblock: Superblock) -> None:
-    """Initialize bitmap to all zeros (all blocks free)."""
-    bitmap_start = superblock.bitmap_start_block
-    bitmap_blocks = superblock.bitmap_block_count
-    zero_data = b'\x00' * (bitmap_blocks * 4096)
-    disk.write_blocks(bitmap_start, zero_data)
+def create_initial_bitmap(disk, superblock: Superblock) -> None:
+    """Initialise the bitmap to all-free (raw write; used by format only)."""
+    disk.write_blocks(superblock.bitmap_start_block,
+                      b"\x00" * (superblock.bitmap_block_count * 4096))

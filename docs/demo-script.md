@@ -1,155 +1,35 @@
-# Demo Script
+# Demo script (about 6 minutes)
 
-## 5-8 Minute Presentation Demonstration
+Setup (before the audience): `python -m webui --image-dir /tmp/demo --open`. Press **New image…**, name `demo.img`, 8 MiB.
 
-This script demonstrates the crash-recoverable file system capabilities for an Operating Systems course presentation.
+**0:00 – Why journaling (30 s).** Open *System overview*. "A multi-block metadata update can be cut off by a
+crash. We write the change to a log first, make the log durable, commit, then apply it. Recovery replays
+committed transactions."
 
-### Prerequisites
+**0:30 – Normal operation (90 s).** *File browser* → New folder `docs`; New file `docs/a.txt` with text.
+Switch to *Journal & transactions*: select the newest tx. Point out the records (target block, offset,
+length), the lit lifecycle stages and the txid. Open *Disk explorer*: superblock block 0 shows
+`checkpoint_txid` and `journal_tail`; click the inode of `a.txt` to show its block pointer.
 
-```bash
-# Ensure we start clean
-rm -f demo.img
-python -m src.cli demo.img --format --size 16M --journal-blocks 128 --inode-blocks 64 --label "DemoVolume"
-```
+**2:00 – The crash (120 s).** *Crash lab*. Pick **7 · AFTER_COMMIT_FLUSH**, operation *create file*, Run.
+Narrate the steps: a separate process is SIGKILLed (return code −9); the crashed image is inspected
+*before* recovery (the new file is not visible yet); a fresh process mounts, replays tx and verifies.
+Show Expected = Actual, checks all green, "replayed 1". Then pick **4 · AFTER_JOURNAL_FLUSH** and run: now the
+file must be **absent** — journal complete but never committed, so it is discarded.
 
-### Demo Sequence (Total: ~6 minutes)
+**4:00 – Prove it is safe to repeat (45 s).** Run **14 · crash during recovery replay**: recovery itself is
+killed and the next recovery still reaches the same state (idempotent).
 
-#### 1. Format and Mount (30 seconds)
+**Optional live proof on your own file (60 s).** *File browser* → select `docs/a.txt` → **Crash demo…** → overwrite
+with new text → confirm. The red "CRASHED" bar appears and the file still shows the old text (the update is only
+in the journal; see *Journal* → `committed-pending-replay`). Click **Run recovery**: the new text appears.
 
-```bash
-python -m src.cli demo.img
-crfs> format 16M 128 64 "DemoVolume"
-crfs> df
-```
+**4:45 – Consistency (45 s).** *Consistency checker* → Run: PASSED. Optional: explain that the test-suite
+seeds real corruption and fsck reports it with a reason.
 
-**Expected output**: Shows 16MB disk, ~4000 free blocks, 1024 inodes
+**5:30 – Honesty slide (30 s).** *Event log* shows every step with timestamps/txids. State the limits: simulated
+disk with a modelled volatile cache, not real power-loss safety (`docs/limitations.md`).
 
-#### 2. Create Directory Structure (45 seconds)
-
-```bash
-crfs> mkdir /projects
-crfs> mkdir /projects/demo
-crfs> mkdir /projects/demo/src
-crfs> ls /projects/demo
-```
-
-**Expected output**: Empty directory listing
-
-#### 3. Create and Write File (45 seconds)
-
-```bash
-crfs> create /projects/demo/README.txt
-crfs> write /projects/demo/README.txt "OLD DATA - Initial version"
-crfs> read /projects/demo/README.txt
-crfs> stat /projects/demo/README.txt
-```
-
-**Expected output**: File content "OLD DATA - Initial version", size 26 bytes, 1 block
-
-#### 4. Demonstrate Persistence (30 seconds)
-
-```bash
-crfs> exit
-python -m src.cli demo.img
-crfs> read /projects/demo/README.txt
-```
-
-**Expected output**: "OLD DATA - Initial version" - data persists across restarts
-
-#### 5. Crash During File Replacement - BEFORE COMMIT (60 seconds)
-
-```bash
-crfs> enable-crash-injection exception
-crfs> crash-test crash_after_journal_flush_before_commit
-crfs> write /projects/demo/README.txt "NEW DATA - This should not appear"
-# Operation crashes here
-crfs> exit
-```
-
-**Expected output**: Crash injected during write operation
-
-#### 6. Recovery After Crash (45 seconds)
-
-```bash
-python -m src.cli demo.img
-crfs> read /projects/demo/README.txt
-crfs> check
-```
-
-**Expected output**: "OLD DATA - Initial version" - old data preserved, consistency check passes
-
-#### 7. Crash During File Replacement - AFTER COMMIT (60 seconds)
-
-```bash
-crfs> enable-crash-injection exception
-crfs> crash-test crash_after_commit_flush_before_apply
-crfs> write /projects/demo/README.txt "NEW DATA - This SHOULD appear after recovery"
-# Operation crashes here
-crfs> exit
-```
-
-**Expected output**: Crash injected after commit but before home apply
-
-#### 8. Recovery of Committed Transaction (45 seconds)
-
-```bash
-python -m src.cli demo.img
-crfs> read /projects/demo/README.txt
-crfs> check
-```
-
-**Expected output**: "NEW DATA - This SHOULD appear after recovery" - committed transaction replayed
-
-#### 9. Consistency Check and Disk Usage (30 seconds)
-
-```bash
-crfs> check
-crfs> df
-crfs> dump
-```
-
-**Expected output**: Consistency check passes, disk usage statistics, full dump
-
-#### 10. Nested Operations and Cleanup (45 seconds)
-
-```bash
-crfs> mkdir /projects/demo/docs
-crfs> create /projects/demo/docs/notes.txt
-crfs> write /projects/demo/docs/notes.txt "Meeting notes"
-crfs> ls /projects/demo
-crfs> rename /projects/demo/README.txt /projects/demo/OLD_README.txt
-crfs> delete /projects/demo/docs/notes.txt
-crfs> rmdir /projects/demo/docs
-crfs> ls /projects/demo
-```
-
-**Expected output**: Directory operations work correctly
-
-#### 11. Run Automated Crash Test Suite (60 seconds)
-
-```bash
-crfs> exit
-python -m pytest tests/ -v -k "crash"
-```
-
-**Expected output**: All crash injection tests pass
-
-### Key Points to Highlight
-
-1. **Write-Ahead Journaling**: Metadata changes are logged before applying
-2. **Atomic Transactions**: Operations either fully commit or fully abort
-3. **Idempotent Recovery**: Replay is safe to run multiple times
-4. **Consistency Guarantees**: Checker validates structural integrity
-5. **Deterministic Testing**: Crash injection enables reproducible testing
-
-### Cleanup
-
-```bash
-rm -f demo.img
-```
-
-### Troubleshooting
-
-- If crash doesn't trigger: Ensure `enable-crash-injection exception` is run before `crash-test`
-- If recovery fails: Check `check` output for errors
-- If disk full: Use larger disk size or fewer test files
+Likely viva questions: why flush before commit? (so a durable commit always has durable log records); why is
+replay idempotent? (after-images are absolute); what if the commit record is torn? (CRC fails → discarded);
+why copy-on-write data? (old file stays valid until the commit).

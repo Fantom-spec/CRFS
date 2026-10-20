@@ -1,328 +1,202 @@
 """
 Crash Injector Module
 
-Provides deterministic crash injection for testing crash recovery.
-Supports both in-process (exception-based) and subprocess (SIGKILL) modes.
+Deterministic crash injection.
+
+The engine calls ``disk.fire(point, info)`` at every important boundary of the
+commit/recovery protocol.  A ``CrashInjector`` attached to the disk decides
+whether this is *the* crash:
+
+* ``CrashMode.EXCEPTION``  - the injector first makes the disk behave as if
+  power was lost (all unflushed writes are discarded, the file handle is
+  closed) and then raises ``CrashInjectedError``.  Fast; used by unit tests.
+* ``CrashMode.SUBPROCESS`` - the injector SIGKILLs the current process.  The
+  process gets no chance to flush, close or clean up.  Used by the
+  subprocess crash tests and by the UI crash lab.
+* ``CrashMode.NONE``       - only records that the point was reached.
+
+``enable(point, count=k)`` crashes on the k-th time the point is reached.
+For the mid-flush points (DURING_*_WRITE) ``count`` selects *which physical
+block write* of the flush is the last to NOT happen, so count=1 means "none of
+the pending blocks reached the disk", count=3 means "two did".  ``torn_bytes``
+additionally persists only a prefix of the block that was about to be written
+(a torn sector write).
 """
 
 import os
-import sys
 import signal
-import subprocess
-import time
-from enum import Enum
 from dataclasses import dataclass
-from typing import Callable, Optional, List, Dict, Any
-from .virtual_disk import VirtualDisk, CrashPoint
+from enum import Enum
+from typing import Any, Callable, Dict, List, Optional
+
+from .virtual_disk import CrashInjectedError, CrashPoint, VirtualDisk
 
 
 class CrashMode(Enum):
-    """Crash injection mode."""
-    EXCEPTION = "exception"      # Raise exception in-process
-    SUBPROCESS = "subprocess"    # Kill subprocess
-    NONE = "none"                # No crash injection
+    EXCEPTION = "exception"
+    SUBPROCESS = "subprocess"
+    NONE = "none"
 
 
 @dataclass
 class CrashScenario:
-    """Defines a crash test scenario."""
     name: str
     description: str
     crash_point: CrashPoint
-    operation: str  # Description of operation being tested
-    expected_outcome: str  # Expected result after recovery
+    operation: str
+    expected_outcome: str
+    # 'rolled_back' -> operation must NOT survive recovery
+    # 'committed'   -> operation MUST survive recovery
+    # (under the volatile-cache durability model; see docs/journaling-and-recovery.md)
+    expected_state: str = "rolled_back"
+    count: int = 1
+    torn_bytes: int = 0
+    phase: str = "transaction"  # or 'recovery'
 
 
 class CrashInjector:
-    """
-    Manages crash injection for testing.
-    
-    Supports:
-    - In-process exception-based crashes (for unit tests)
-    - Subprocess termination (for realistic crash testing)
-    - Configurable crash points
-    - Scenario orchestration
-    """
-    
-    # Predefined crash scenarios
     SCENARIOS = [
-        CrashScenario(
-            name="crash_before_journal_write",
-            description="Crash before writing journal records",
-            crash_point=CrashPoint.BEFORE_JOURNAL_WRITE,
-            operation="file_create",
-            expected_outcome="File not created, no journal records"
-        ),
-        CrashScenario(
-            name="crash_during_journal_write",
-            description="Crash during journal record writing",
-            crash_point=CrashPoint.BEFORE_JOURNAL_WRITE,  # In practice, would be mid-write
-            operation="file_create",
-            expected_outcome="Partial journal records, transaction discarded"
-        ),
-        CrashScenario(
-            name="crash_after_journal_write_before_flush",
-            description="Crash after journal write but before flush",
-            crash_point=CrashPoint.AFTER_JOURNAL_WRITE,
-            operation="file_create",
-            expected_outcome="Journal records in OS buffer, not on disk - discarded"
-        ),
-        CrashScenario(
-            name="crash_after_journal_flush_before_commit",
-            description="Crash after journal flush but before commit record",
-            crash_point=CrashPoint.AFTER_JOURNAL_FLUSH,
-            operation="file_create",
-            expected_outcome="Journal records on disk, no commit - discarded"
-        ),
-        CrashScenario(
-            name="crash_during_commit_write",
-            description="Crash during commit record write",
-            crash_point=CrashPoint.BEFORE_COMMIT_WRITE,
-            operation="file_create",
-            expected_outcome="Torn commit record - discarded"
-        ),
-        CrashScenario(
-            name="crash_after_commit_write_before_flush",
-            description="Crash after commit write but before commit flush",
-            crash_point=CrashPoint.AFTER_COMMIT_WRITE,
-            operation="file_create",
-            expected_outcome="Commit record in OS buffer - may or may not be durable"
-        ),
-        CrashScenario(
-            name="crash_after_commit_flush_before_apply",
-            description="Crash after commit flush but before home block apply",
-            crash_point=CrashPoint.AFTER_COMMIT_FLUSH,
-            operation="file_create",
-            expected_outcome="Transaction committed, replay applies changes"
-        ),
-        CrashScenario(
-            name="crash_during_home_apply",
-            description="Crash during home block application",
-            crash_point=CrashPoint.BEFORE_HOME_WRITE,
-            operation="file_create",
-            expected_outcome="Transaction committed, replay completes apply"
-        ),
-        CrashScenario(
-            name="crash_after_home_apply_before_flush",
-            description="Crash after home apply but before home flush",
-            crash_point=CrashPoint.AFTER_HOME_WRITE,
-            operation="file_create",
-            expected_outcome="Home blocks in OS buffer - replay re-applies"
-        ),
-        CrashScenario(
-            name="crash_after_home_flush_before_checkpoint",
-            description="Crash after home flush but before checkpoint",
-            crash_point=CrashPoint.AFTER_HOME_FLUSH,
-            operation="file_create",
-            expected_outcome="Transaction fully applied, checkpoint advances on next mount"
-        ),
-        CrashScenario(
-            name="crash_during_checkpoint",
-            description="Crash during checkpoint write",
-            crash_point=CrashPoint.BEFORE_CHECKPOINT,
-            operation="file_create",
-            expected_outcome="Checkpoint incomplete, next recovery re-scans"
-        ),
-        CrashScenario(
-            name="crash_during_recovery_scan",
-            description="Crash during recovery journal scan",
-            crash_point=CrashPoint.DURING_RECOVERY_SCAN,
-            operation="recovery",
-            expected_outcome="Recovery restarts, same result"
-        ),
-        CrashScenario(
-            name="crash_during_recovery_replay",
-            description="Crash during recovery replay",
-            crash_point=CrashPoint.DURING_RECOVERY_REPLAY,
-            operation="recovery",
-            expected_outcome="Recovery restarts, idempotent replay completes"
-        ),
+        CrashScenario("crash_before_journal_write", "Crash before any journal record is written",
+                      CrashPoint.BEFORE_JOURNAL_WRITE, "file_create",
+                      "Nothing reached the disk; operation absent", "rolled_back"),
+        CrashScenario("crash_during_journal_write",
+                      "Crash in the middle of the journal flush (only some blocks persisted)",
+                      CrashPoint.DURING_JOURNAL_WRITE, "file_create",
+                      "Torn journal, no commit record; transaction discarded", "rolled_back"),
+        CrashScenario("crash_after_journal_write_before_flush",
+                      "Crash after journal records were written but before they were flushed",
+                      CrashPoint.AFTER_JOURNAL_WRITE, "file_create",
+                      "Journal records only in the volatile cache; lost", "rolled_back"),
+        CrashScenario("crash_after_journal_flush_before_commit",
+                      "Journal flushed but commit record not yet written",
+                      CrashPoint.AFTER_JOURNAL_FLUSH, "file_create",
+                      "Complete journal records but no commit; discarded", "rolled_back"),
+        CrashScenario("crash_during_commit_write",
+                      "Commit record torn (only a prefix of its block persisted)",
+                      CrashPoint.DURING_COMMIT_WRITE, "file_create",
+                      "Torn commit record fails its checksum; discarded", "rolled_back", torn_bytes=12),
+        CrashScenario("crash_after_commit_write_before_flush",
+                      "Commit record written but not flushed",
+                      CrashPoint.AFTER_COMMIT_WRITE, "file_create",
+                      "Commit not durable (volatile cache); discarded", "rolled_back"),
+        CrashScenario("crash_after_commit_flush_before_apply",
+                      "Commit durable, home locations not yet updated",
+                      CrashPoint.AFTER_COMMIT_FLUSH, "file_create",
+                      "Committed: recovery replays the journal", "committed"),
+        CrashScenario("crash_during_home_apply",
+                      "Crash while home metadata blocks are being persisted",
+                      CrashPoint.DURING_HOME_WRITE, "file_create",
+                      "Committed; some home blocks updated, recovery completes the rest", "committed",
+                      count=2),
+        CrashScenario("crash_after_home_apply_before_flush",
+                      "Home blocks written but not flushed",
+                      CrashPoint.AFTER_HOME_WRITE, "file_create",
+                      "Committed; home writes lost, recovery re-applies", "committed"),
+        CrashScenario("crash_after_home_flush_before_checkpoint",
+                      "Home blocks durable, checkpoint not yet persisted",
+                      CrashPoint.AFTER_HOME_FLUSH, "file_create",
+                      "Committed; replay is idempotent", "committed"),
+        CrashScenario("crash_during_checkpoint",
+                      "Crash while the checkpoint (superblock) is being persisted",
+                      CrashPoint.DURING_CHECKPOINT_WRITE, "file_create",
+                      "Committed; old checkpoint stays, recovery re-replays idempotently", "committed"),
+        CrashScenario("crash_after_checkpoint",
+                      "Crash right after the checkpoint became durable",
+                      CrashPoint.AFTER_CHECKPOINT, "file_create",
+                      "Committed and checkpointed; nothing to replay", "committed"),
+        CrashScenario("crash_during_recovery_scan",
+                      "Crash while recovery is scanning the journal",
+                      CrashPoint.DURING_RECOVERY_SCAN, "recovery",
+                      "Recovery restarts and reaches the same result", "committed", phase="recovery"),
+        CrashScenario("crash_during_recovery_replay",
+                      "Crash while recovery is replaying committed transactions",
+                      CrashPoint.DURING_RECOVERY_REPLAY, "recovery",
+                      "Recovery restarts; idempotent replay completes", "committed", phase="recovery"),
     ]
-    
+
     def __init__(self, mode: CrashMode = CrashMode.EXCEPTION):
         self.mode = mode
         self._crash_point: Optional[CrashPoint] = None
-        self._crash_callback: Optional[Callable[[CrashPoint], None]] = None
         self._enabled = False
-        self._crash_count = 0
-        self._target_crash_count = 1
-    
-    def enable(self, crash_point: CrashPoint, count: int = 1) -> None:
-        """Enable crash injection at specific point."""
+        self._count = 0
+        self._target = 1
+        self._torn_bytes = 0
+        self._disk: Optional[VirtualDisk] = None
+        self._crash_callback: Optional[Callable[[CrashPoint], None]] = None
+        self.events = None
+        self.reached: List[str] = []
+        self.crashed_at: Optional[CrashPoint] = None
+
+    # ------------------------------------------------------------ control
+    def attach_disk(self, disk: VirtualDisk) -> None:
+        self._disk = disk
+
+    def enable(self, crash_point: CrashPoint, count: int = 1, torn_bytes: int = 0) -> None:
         self._crash_point = crash_point
-        self._target_crash_count = count
-        self._crash_count = 0
+        self._target = max(1, count)
+        self._count = 0
+        self._torn_bytes = torn_bytes
         self._enabled = True
-    
+
     def disable(self) -> None:
-        """Disable crash injection."""
         self._enabled = False
         self._crash_point = None
-    
+
+    @property
+    def enabled(self) -> bool:
+        return self._enabled
+
     def set_callback(self, callback: Callable[[CrashPoint], None]) -> None:
-        """Set callback to invoke at crash point."""
         self._crash_callback = callback
-    
-    def maybe_crash(self, point: CrashPoint) -> None:
-        """Check if crash should be injected at this point."""
+
+    # --------------------------------------------------------------- hook
+    def maybe_crash(self, point: CrashPoint, info: Optional[dict] = None) -> None:
         if not self._enabled or self._crash_point is None:
             return
-        
         if point == self._crash_point:
-            self._crash_count += 1
-            if self._crash_count >= self._target_crash_count:
-                self._trigger_crash(point)
-    
-    def _trigger_crash(self, point: CrashPoint) -> None:
-        """Trigger the crash."""
+            self._count += 1
+            if self._count >= self._target:
+                self._trigger_crash(point, info)
+
+    __call__ = maybe_crash
+
+    def _trigger_crash(self, point: CrashPoint, info: Optional[dict]) -> None:
+        self.crashed_at = point
+        if self.events is not None:
+            self.events.emit("crash_injected", f"CRASH injected at {point.name}"
+                             + (f" (block {info['block']}, {info['index']}/{info['total']})"
+                                if info and 'block' in info else ""),
+                             severity="error", point=point.name, mode=self.mode.value,
+                             info=info or {})
         if self._crash_callback:
             self._crash_callback(point)
-        
-        if self.mode == CrashMode.EXCEPTION:
-            raise CrashInjectedError(f"Crash injected at {point.name}")
-        elif self.mode == CrashMode.SUBPROCESS:
-            # In subprocess mode, the parent process manages the kill
+        if self.mode == CrashMode.NONE:
+            return
+        # torn sector write of the block that was about to be written
+        if self._torn_bytes and info and "block" in info and self._disk is not None:
+            self._disk.torn_write(info["block"], self._torn_bytes)
+        if self.mode == CrashMode.SUBPROCESS:
             os.kill(os.getpid(), signal.SIGKILL)
-        else:
-            pass  # NONE mode - just record
-    
+        if self._disk is not None:
+            self._disk.crash()          # power loss: unflushed writes vanish
+        raise CrashInjectedError(f"Crash injected at {point.name}", point)
+
+    # ---------------------------------------------------------- scenarios
     def get_scenarios(self) -> List[CrashScenario]:
-        """Get all predefined crash scenarios."""
         return self.SCENARIOS
-    
+
     def get_scenario(self, name: str) -> Optional[CrashScenario]:
-        """Get scenario by name."""
         for s in self.SCENARIOS:
             if s.name == name:
                 return s
         return None
 
 
-class CrashInjectedError(Exception):
-    """Raised when crash is injected in exception mode."""
-    pass
-
-
-class SubprocessCrashRunner:
-    """
-    Runs crash tests in subprocesses for realistic crash simulation.
-    
-    This is the preferred mode for integration testing because it
-    actually terminates the process, simulating power loss.
-    """
-    
-    def __init__(self, test_script: str, disk_image: str):
-        self.test_script = test_script
-        self.disk_image = disk_image
-        self.results: List[Dict[str, Any]] = []
-    
-    def run_scenario(self, scenario: CrashScenario, setup_commands: List[str]) -> Dict[str, Any]:
-        """
-        Run a crash scenario in a subprocess.
-        
-        Args:
-            scenario: Crash scenario to test
-            setup_commands: Commands to run before crash point
-            
-        Returns:
-            Result dictionary with outcome
-        """
-        # Create test script that:
-        # 1. Runs setup commands
-        # 2. Enables crash injection at scenario.crash_point
-        # 3. Performs the operation
-        # 4. If crash injected, process dies
-        # 5. Parent process restarts, runs recovery, checks result
-        
-        test_code = self._generate_test_code(scenario, setup_commands)
-        
-        # Write test script
-        script_path = f"/tmp/crash_test_{scenario.name}.py"
-        with open(script_path, 'w') as f:
-            f.write(test_code)
-        
-        # Run subprocess
-        start_time = time.time()
-        try:
-            result = subprocess.run(
-                [sys.executable, script_path],
-                capture_output=True,
-                text=True,
-                timeout=30
-            )
-            duration = time.time() - start_time
-            
-            crashed = result.returncode != 0 and result.returncode != -signal.SIGKILL
-            killed = result.returncode == -signal.SIGKILL
-            
-            return {
-                'scenario': scenario.name,
-                'crashed': crashed,
-                'killed': killed,
-                'returncode': result.returncode,
-                'stdout': result.stdout,
-                'stderr': result.stderr,
-                'duration': duration,
-            }
-        except subprocess.TimeoutExpired:
-            return {
-                'scenario': scenario.name,
-                'crashed': False,
-                'killed': False,
-                'error': 'Timeout',
-                'duration': time.time() - start_time,
-            }
-    
-    def _generate_test_code(self, scenario: CrashScenario, setup_commands: List[str]) -> str:
-        """Generate test script for scenario."""
-        # This is a template - actual implementation would be more complex
-        return f'''
-import sys
-sys.path.insert(0, "{os.path.dirname(os.path.abspath(__file__))}")
-
-from src.filesystem import FileSystem
-from src.crash_injector import CrashInjector, CrashMode, CrashPoint
-
-# Setup
-fs = FileSystem("{self.disk_image}")
-fs.mount()
-
-# Run setup commands
-{chr(10).join(setup_commands)}
-
-# Enable crash injection
-injector = CrashInjector(CrashMode.SUBPROCESS)
-injector.enable(CrashPoint.{scenario.crash_point.name})
-
-# Perform operation (this should crash)
-try:
-    # Operation would go here
-    pass
-except Exception as e:
-    print(f"Crashed: {{e}}")
-    sys.exit(1)
-
-print("Completed without crash")
-sys.exit(0)
-'''
-    
-    def run_all_scenarios(self, setup_commands: List[str]) -> List[Dict[str, Any]]:
-        """Run all crash scenarios."""
-        results = []
-        for scenario in CrashInjector.SCENARIOS:
-            print(f"Running scenario: {scenario.name}")
-            result = self.run_scenario(scenario, setup_commands)
-            results.append(result)
-            print(f"  Result: {'CRASHED' if result.get('crashed') or result.get('killed') else 'NO CRASH'}")
-        return results
-
-
-# Global crash injector instance for easy access
+# Global injector (kept for API compatibility with the original CLI)
 _global_injector: Optional[CrashInjector] = None
 
 
 def get_global_injector() -> CrashInjector:
-    """Get or create global crash injector."""
     global _global_injector
     if _global_injector is None:
         _global_injector = CrashInjector()
@@ -330,12 +204,9 @@ def get_global_injector() -> CrashInjector:
 
 
 def set_global_injector(injector: CrashInjector) -> None:
-    """Set global crash injector."""
     global _global_injector
     _global_injector = injector
 
 
 def maybe_crash(point: CrashPoint) -> None:
-    """Global crash point function."""
-    injector = get_global_injector()
-    injector.maybe_crash(point)
+    get_global_injector().maybe_crash(point)
