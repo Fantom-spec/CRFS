@@ -24,6 +24,62 @@ python -m webui --image-dir crfs_images --open         # http://127.0.0.1:8765/
 Developed and tested on Python 3.13 (older 3.x versions are untested); the engine and UI use only the standard library. `pytest` is only needed for the legacy
 test file; Playwright is only needed for the optional browser tests.
 
+## Command cheat sheet
+
+Run everything from the project folder.
+
+### Web monitor
+```bash
+python -m webui --image-dir crfs_images --open      # start the UI at http://127.0.0.1:8765/
+python -m webui --image-dir crfs_images --port 8800 # use another port if 8765 is busy
+```
+Ctrl+C stops it. In the UI: **New image…** creates a disk, **File browser → Crash demo…** crashes your own file,
+**Run recovery** (red bar) repairs it, **Crash lab** runs the 14 scripted scenarios on a throw-away disk.
+
+### CLI
+```bash
+python -m src.cli demo.img --format --size 8M            # create and format an image
+python -m src.cli demo.img                               # interactive shell (type help)
+python -m src.cli demo.img -c "mkdir /docs"              # one command
+python -m src.cli demo.img -c "create /docs/a.txt"
+python -m src.cli demo.img -c "write /docs/a.txt hello"
+python -m src.cli demo.img -c "read /docs/a.txt"
+python -m src.cli demo.img -c "ls /docs"
+python -m src.cli demo.img -c "journal"                  # journal head/tail and every transaction
+python -m src.cli demo.img -c "check"                    # fsck
+python -m src.cli demo.img --no-recovery -c "ls /"       # open WITHOUT recovery (read-only, shows the raw crashed disk)
+python -m src.cli demo.img --cache-mode writethrough     # weaker disk model (default is volatile)
+python -m src.cli demo.img --checkpoint lazy             # checkpoint only when the journal fills
+```
+
+### Crash demo in the terminal (shows the crash with your own eyes)
+```bash
+rm -f demo.img
+python -m src.crash_worker '{"phase":"setup","image":"demo.img","operation":"write_file"}'
+python -m src.cli demo.img --no-recovery -c "read /lab/data.txt"      # OLD DATA
+python -m src.crash_worker '{"phase":"crash","image":"demo.img","operation":"write_file","point":"AFTER_COMMIT_FLUSH"}'
+echo $?                                                               # 137 = killed by SIGKILL
+python -m src.cli demo.img --no-recovery -c "read /lab/data.txt"      # still OLD DATA (crashed disk)
+python -m src.cli demo.img --no-recovery -c "journal"                 # last tx: committed-pending-replay
+python -m src.cli demo.img -c "read /lab/data.txt"                    # NEW DATA (recovery ran)
+python -m src.cli demo.img -c "check"                                 # Consistency check PASSED
+```
+Contrast (update is lost, old data intact): repeat with `"point":"AFTER_JOURNAL_FLUSH"`.
+For a file that disappears and comes back, use `"operation":"create_file"` and `ls /lab` instead of `read`.
+Operations: `create_file`, `write_file`, `mkdir`, `delete_file`, `rename_file`, `multi_block_write`.
+Crash points: see `python -m src.cli x.img -c "crash-test"` for the 14 scenario names.
+
+### One-shot scripted scenario (temporary image, prints PASS/FAIL)
+```bash
+python -m src.cli demo.img -c "crash-test crash_after_commit_flush_before_apply write_file"
+```
+
+### Tests
+```bash
+python -m unittest tests.test_engine_integrity tests.test_crash_recovery tests.test_webui tests.test_webui_e2e -v
+python -m pytest tests/test_filesystem.py                # original suite (needs pytest)
+```
+
 ## Layout
 
 ```
